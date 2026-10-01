@@ -1,25 +1,25 @@
+alias ClickhouseExLogger.TestContainer
+
+# The suite's ClickHouse is a container, started here rather than in a test
+# module, so all of it shares one server. Five modules need ClickHouse; booting
+# one per module would cost five ClickHouse startups per run.
+#
+# This is also where the suite stops tolerating a missing database. The old
+# harness excluded `:clickhouse` tests when no server answered and reported
+# green — which is precisely how a test that exists to prove the pipeline
+# survives a stalled ClickHouse could end up never running. Failing here is the
+# point. The four modules that need no database still run without an engine.
+TestContainer.start()
+
+Application.put_env(:clickhouse_ex_logger, ClickhouseExLogger.Repo, TestContainer.repo_config())
+
+# The schema goes through the same code path a host application runs, so the
+# suite keeps covering `mix clickhouse_ex_logger.migrate`'s target rather than a
+# parallel one.
+{:ok, _summary} = ClickhouseExLogger.Migration.setup()
+
 ExUnit.start()
 
-# ClickHouse-backed tests are tagged `:clickhouse`.
-#
-# With no server reachable, exclude them and say why, rather than reporting
-# dozens of connection failures. With a server reachable, create the test schema
-# through the same code path a host application uses, so the suite is
-# self-contained.
-#
-# This is test *setup*, not application boot — `clickhouse_logger` itself never
-# creates ClickHouse schema at runtime. See `ClickhouseLogger.NoSchemaAtBootTest`.
-alias ClickhouseLogger.TestServer
-
-if TestServer.available?() do
-  {:ok, _summary} = ClickhouseLogger.Migration.setup()
-  ExUnit.configure(exclude: [])
-else
-  IO.puts("""
-
-  Skipping :clickhouse tests — #{TestServer.unavailable_message()}
-
-  """)
-
-  ExUnit.configure(exclude: [clickhouse: 1])
-end
+ExUnit.after_suite(fn _results ->
+  IO.puts(TestContainer.cleanup_hint())
+end)

@@ -1,4 +1,4 @@
-defmodule ClickhouseLogger.CaptureHandler do
+defmodule ClickhouseExLogger.CaptureHandler do
   @moduledoc """
   A `:logger` handler that forwards events to a pid, for tests.
 
@@ -19,7 +19,7 @@ defmodule ClickhouseLogger.CaptureHandler do
   @spec install(pid()) :: atom()
   def install(pid) do
     handler_id =
-      String.to_atom("clickhouse_logger_capture_#{System.unique_integer([:positive])}")
+      String.to_atom("clickhouse_ex_logger_capture_#{System.unique_integer([:positive])}")
 
     :ok =
       :logger.add_handler(

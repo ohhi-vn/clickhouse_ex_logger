@@ -1,0 +1,8 @@
+schema: spec-driven
+created: 2026-10-01
+
+# Spec delta present for one reason only: `ClickhouseExLogger.Event.row/2`
+# documents that it never raises, and its `rescue ArgumentError` cannot fire
+# because `IO.chardata_to_string/1` raises `UnicodeConversionError`. See
+# specs/clickhouse-log-handler/spec.md. Everything else in this change is tests
+# plus the tooling needed to measure them.

@@ -20,15 +20,22 @@ erl_crash.dump
 *.ez
 
 # Ignore package tarball (built via "mix hex.build").
-clickhouse_logger-*.tar
+clickhouse_ex_logger-*.tar
 
-# AppleDouble sidecar files. Some network/external volumes (SMB, exFAT) create
-# these next to every file, and Mix will happily compile them into the build
-# ("corrupt file header" / "table name already exists"). Ignore them, and run
-# `find . -name '._*' -delete` if a build breaks mysteriously.
-/._*
+# AppleDouble sidecar files. macOS writes a 4096-byte `._name` beside any file
+# carrying an extended attribute when the filesystem cannot store the attribute
+# itself, which exFAT and SMB volumes cannot — so every file this toolchain
+# writes gets one. Ignore them.
+#
+# `mix test` clears the ones under `_build/` before it runs (see
+# `purge_sidecars/1` in mix.exs), because `:cover` hands a stub to the Erlang
+# compiler and aborts the run. If you invoke the task some other way, or a build
+# breaks mysteriously with "corrupt file header" or "table name already exists",
+# run `find . -name '._*' -delete`.
+._*
 **/._*
 .DS_Store
 
 .opencode
 .expert
+.dexter.db*

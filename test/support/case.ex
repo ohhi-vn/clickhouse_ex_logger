@@ -1,42 +1,62 @@
-defmodule ClickhouseLogger.Case do
+defmodule ClickhouseExLogger.Case do
   @moduledoc """
-  Case template for tests that need a live ClickHouse.
+  Case template for tests that need the suite's ClickHouse.
 
-  Tests using it are tagged `:clickhouse`. `test/test_helper.exs` excludes that
-  tag when no ClickHouse answers at `CLICKHOUSE_URL`, so the suite stays green on
-  a machine without one, and creates the test schema when one does.
+  Tests using it are tagged `:clickhouse` and run **synchronously** by default.
+  That default is load-bearing rather than cautious:
 
-  Start a server with the `docker-compose.yml` in this repo, or point
-  `CLICKHOUSE_URL` at your own.
+    * `ClickhouseExLogger.Buffer` is a globally-named process, and so is the
+      `ClickhouseExLogger.Repo` connection. `Handler.install/2` starts the first,
+      `Handler.uninstall/1` stops it, and tests that swap the repo's database or
+      URL restart the second. Two `async: true` modules doing either of those
+      pull state out from under each other.
+
+    * `ClickhouseExLogger.WorkloadTest` freezes the shared container to simulate a
+      stalled ClickHouse. That must not happen while another module is writing.
+
+  ExUnit runs every `async: true` module to completion before any synchronous
+  one, so a synchronous module has the container to itself by construction
+  rather than by timing.
+
+  A module that only reads shared state, and cannot collide, can opt in:
+
+      use ClickhouseExLogger.Case, async: true
+
+  ## Requirements
+
+  `mix test` starts the container (see `ClickhouseExLogger.TestContainer`), so a
+  running Podman or Docker engine is required. The suite fails with a diagnostic
+  rather than skipping when there is none.
   """
 
-  use ExUnit.CaseTemplate
+  defmacro __using__(opts) do
+    async = Keyword.get(opts, :async, false)
 
-  alias ClickhouseLogger.TestServer
-
-  using do
     quote do
-      import ClickhouseLogger.Case
+      use ExUnit.Case, async: unquote(async)
+
+      import ClickhouseExLogger.Case
 
       @moduletag :clickhouse
+
+      setup_all do
+        unless ClickhouseExLogger.TestServer.table_exists?() do
+          raise """
+          #{ClickhouseExLogger.TestServer.database()}.logs is missing even though \
+          #{ClickhouseExLogger.TestServer.url()} is reachable.
+
+          test/test_helper.exs creates it. If you are running a subset, create it
+          with `mix clickhouse_ex_logger.migrate`.
+          """
+        end
+
+        :ok
+      end
     end
-  end
-
-  setup_all do
-    unless TestServer.table_exists?() do
-      raise """
-      #{TestServer.database()}.logs is missing even though #{TestServer.url()} is reachable.
-
-      test/test_helper.exs normally creates it. If you are running a subset,
-      create it with `mix clickhouse_logger.migrate`.
-      """
-    end
-
-    :ok
   end
 
   @doc """
   Empties the `logs` table so the test starts from a known state.
   """
-  def truncate_logs!, do: TestServer.truncate_logs!()
+  def truncate_logs!, do: ClickhouseExLogger.TestServer.truncate_logs!()
 end

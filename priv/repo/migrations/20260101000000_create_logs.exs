@@ -1,8 +1,8 @@
-defmodule ClickhouseLogger.Migrations.CreateLogsTable do
+defmodule ClickhouseExLogger.Migrations.CreateLogsTable do
   @moduledoc """
   Creates the `logs` table.
 
-  Run it with `mix clickhouse_logger.migrate`. See `README.md`.
+  Run it with `mix clickhouse_ex_logger.migrate`. See `README.md`.
   """
 
   @behaviour AshClickhouse.Schema
@@ -11,7 +11,7 @@ defmodule ClickhouseLogger.Migrations.CreateLogsTable do
 
   @doc "The repo this migration targets."
   @impl true
-  def repo, do: ClickhouseLogger.Repo
+  def repo, do: ClickhouseExLogger.Repo
 
   @doc """
   The migration version, recorded in ClickHouse's `schema_migrations` table so
@@ -23,13 +23,13 @@ defmodule ClickhouseLogger.Migrations.CreateLogsTable do
   @doc """
   The `CREATE TABLE` statement.
 
-  Generated from `ClickhouseLogger.LogEntry` by
+  Generated from `ClickhouseExLogger.LogEntry` by
   `AshClickhouse.Migration.create_table_cql/1`, so the table and the resource
   cannot drift apart. Do not hand-edit this.
   """
   @impl true
   def change do
-    [AshClickhouse.Migration.create_table_cql(ClickhouseLogger.LogEntry)]
+    [AshClickhouse.Migration.create_table_cql(ClickhouseExLogger.LogEntry)]
   end
 
   @doc "Rolls the migration back by dropping the table."
