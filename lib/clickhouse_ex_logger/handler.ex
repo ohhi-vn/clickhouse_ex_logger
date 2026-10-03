@@ -52,11 +52,13 @@ defmodule ClickhouseExLogger.Handler do
 
   ## Configuration
 
-    * `:level` — minimum level to ship. Default `:all`. `:logger` filters on this
-      before `log/2` is called.
+    * `:level` — minimum level to ship. Default `:all`. Must be one of the
+      syslog severity atoms `:logger` accepts. `:logger` filters on this before
+      `log/2` is called.
 
     * `:batch_size` — buffered rows that trigger a write. Default `500`. A
-      *trigger*, not a cap: a write always takes everything buffered.
+      *trigger*, not a cap: a write always takes everything buffered. It cannot
+      exceed `:max_buffer_size`; see that option.
 
     * `:flush_interval_ms` — how often to write a partial batch. Default `1_000`.
 
@@ -64,6 +66,13 @@ defmodule ClickhouseExLogger.Handler do
       discarded to make room, so a slow or unreachable ClickHouse costs you the
       oldest logs rather than unbounded memory or a blocked application. Default
       `10_000`.
+
+      This is also the ceiling `:batch_size` is measured against. Set the two
+      equal for the smallest batch the buffer can write; set `:batch_size` above
+      this and the size trigger can never fire, because the buffer is capped below
+      it — every row past the cap is discarded rather than written, and a
+      `discarded` count that climbs for that reason is indistinguishable from
+      ClickHouse being too slow. `install/2` rejects that combination.
 
     * `:include_node` — whether each row records the name of the node that handled
       it, e.g. `"my_app@10.0.0.5"`. Default `true`. This is a *handler* option, not
@@ -75,9 +84,11 @@ defmodule ClickhouseExLogger.Handler do
       absent on a system that is not distributed (`:nonode@nohost`), so filter
       distributed rows with `WHERE node IS NOT NULL`.
 
-  Invalid values (zero, negative, or a non-integer; a non-boolean `:include_node`)
-  fail `install/2` with an error naming the option, rather than failing later
-  during event delivery.
+  Invalid values (zero, negative, or a non-integer; a non-boolean `:include_node`;
+  a `:level` that is not an atom; a `:batch_size` above `:max_buffer_size`) fail
+  `install/2` with an error naming the option, rather than failing later during
+  event delivery. An unrecognised *option name* is not among them: a key this
+  library does not know is passed through to `:logger`, and ignored here.
 
   ## What it guarantees
 
@@ -98,6 +109,10 @@ defmodule ClickhouseExLogger.Handler do
   @default_batch_size 500
   @default_flush_interval_ms 1_000
   @default_max_buffer_size 10_000
+
+  # `:logger`'s `logger:level()` type, which is the whole of what it will accept
+  # for a handler's `:level`.
+  @levels ~w(all debug info notice warning error critical alert emergency)a
 
   @doc """
   The batching defaults applied when a handler config omits them.
@@ -138,7 +153,7 @@ defmodule ClickhouseExLogger.Handler do
   end
 
   @doc """
-  Validates a batching config and returns the options in it.
+  Validates a handler config and returns the options in it.
 
   Returns `{:ok, options}` or `{:error, {option, message}}`. Useful on its own for
   checking a `config/*.exs` at boot.
@@ -150,7 +165,9 @@ defmodule ClickhouseExLogger.Handler do
     with {:ok, batch_size} <- positive_integer(config, :batch_size, @default_batch_size),
          {:ok, interval} <-
            positive_integer(config, :flush_interval_ms, @default_flush_interval_ms),
-         {:ok, max} <- positive_integer(config, :max_buffer_size, @default_max_buffer_size) do
+         {:ok, max} <- positive_integer(config, :max_buffer_size, @default_max_buffer_size),
+         :ok <- validate_level(config),
+         :ok <- validate_batch_fits_buffer(batch_size, max) do
       {:ok, %{batch_size: batch_size, flush_interval_ms: interval, max_buffer_size: max}}
     end
   end
@@ -162,18 +179,31 @@ defmodule ClickhouseExLogger.Handler do
   than duplicated, and an already-registered `handler_id` is not registered
   twice.
 
-  Fails with `{:error, {option, message}}` if the batching config is invalid, and
-  leaves nothing running in that case — a rejected install must not leave a
-  half-attached handler behind.
+  All-or-nothing. Every option is validated before anything is started, and if
+  `:logger` still refuses the registration the buffer this call started is stopped
+  again — a rejected registration leaves no batching machinery behind. A buffer
+  that was already running when the call arrived is never stopped, because this
+  call did not start it.
+
+  Fails with `{:error, {option, message}}` if the handler config is invalid, and
+  with whatever `:logger` returns if it refuses the registration.
   """
   @spec install(atom(), map() | keyword()) ::
           {:ok, atom()} | {:error, {atom(), String.t()}} | {:error, term()}
   def install(handler_id, config \\ %{}) when is_atom(handler_id) do
     with {:ok, options} <- validate(config),
          :ok <- validate_include_node(config),
-         :ok <- ensure_buffer_started(options),
-         {:ok, handler_id} <- register(handler_id, config) do
-      {:ok, handler_id}
+         {:ok, started?} <- ensure_buffer_started(options) do
+      case register(handler_id, config) do
+        {:ok, handler_id} ->
+          {:ok, handler_id}
+
+        {:error, _reason} = error ->
+          # `:logger` rejected the handler. Undo the one effect this call had, and
+          # only that one — a buffer already running belongs to whoever started it.
+          if started?, do: Buffer.stop()
+          error
+      end
     end
   end
 
@@ -186,6 +216,15 @@ defmodule ClickhouseExLogger.Handler do
 
   Returns `:ok` even if the handler was not registered, so it is safe to call
   from a shutdown path unconditionally.
+
+  Both waits are bounded and the row accounting happens where the rows are: the
+  flush's own timeout means it may return without having drained, and this
+  function cannot tell — `Buffer.flush/2` answers `:ok` either way. So nothing is
+  decided from that `:ok`. `Buffer.stop/3` runs the buffer's `terminate/2`, which
+  waits for any outstanding write and makes one final bounded attempt within a
+  fixed budget, and that is the step which decides what happens to rows still
+  held. No branch is needed here for a flush that did not finish, because there is
+  nothing further this function could do about it.
   """
   @spec uninstall(atom()) :: :ok
   def uninstall(handler_id) do
@@ -223,8 +262,7 @@ defmodule ClickhouseExLogger.Handler do
         :ok
 
       value ->
-        {:error,
-         {:include_node, ":include_node must be a boolean, got: #{inspect(value)}"}}
+        {:error, {:include_node, ":include_node must be a boolean, got: #{inspect(value)}"}}
     end
   end
 
@@ -234,8 +272,13 @@ defmodule ClickhouseExLogger.Handler do
   Idempotent: if a buffer is already up it is left alone, so a host that both
   supervises `ClickhouseExLogger.Buffer` and installs the handler does not end up
   with two writers.
+
+  Returns `{:ok, started?}`, where `started?` is `true` when *this call* started
+  the buffer. `install/2` needs that to undo only its own effect if registration
+  then fails, and cannot get it from `GenServer.whereis/1` — by then it cannot
+  tell a buffer it started from one that was already there.
   """
-  @spec ensure_buffer_started(map() | keyword()) :: :ok | {:error, term()}
+  @spec ensure_buffer_started(map() | keyword()) :: {:ok, boolean()} | {:error, term()}
   def ensure_buffer_started(config) do
     case GenServer.whereis(Buffer) do
       nil ->
@@ -243,10 +286,12 @@ defmodule ClickhouseExLogger.Handler do
           {:ok, options} ->
             # No `{:error, {:already_started, _pid}}` clause: the `whereis` above
             # checked microseconds ago, and losing that race is harmless — the
-            # buffer another caller started is serving the same rows.
+            # buffer another caller started is serving the same rows. The
+            # `started?` it would have reported is `false`, which is also right:
+            # this call did not start it.
             case Buffer.start_link(options) do
-              {:ok, _pid} -> :ok
-              {:error, reason} -> {:error, reason}
+              {:ok, _pid} -> {:ok, true}
+              {:error, _reason} = error -> error
             end
 
           {:error, _reason} = error ->
@@ -254,12 +299,16 @@ defmodule ClickhouseExLogger.Handler do
         end
 
       _pid ->
-        :ok
+        {:ok, false}
     end
   end
 
-  # The buffer a row should go to. A host that runs its own buffer under a
-  # different name can override it by setting `:buffer` in the handler's config.
+  # The buffer a row should go to. A host that runs its own buffer can route rows to
+  # it by setting `:buffer` in the handler's config — and the value must be a **pid**,
+  # not a registered name. A name is silently ignored and rows go to the default
+  # buffer, which is worse than rejecting it: the host's own buffer stays empty and
+  # nothing says why. `GenServer.cast/2` takes either, so this narrows what the
+  # option accepts rather than what works.
   defp buffer(%{buffer: pid}) when is_pid(pid), do: pid
   defp buffer(_config), do: Buffer
 
@@ -283,9 +332,46 @@ defmodule ClickhouseExLogger.Handler do
     end
   end
 
-defp remove(handler_id) do
-  :logger.remove_handler(handler_id)
-end
+  defp remove(handler_id) do
+    :logger.remove_handler(handler_id)
+  end
+
+  # Every level `:logger` accepts, per its `logger:level()` type. Checking membership
+  # here rather than passing the value through is what makes a bad level an error
+  # naming the option, like every other one — `:logger` reports it as
+  # `{:error, {:invalid_level, value}}`, which names neither the option this
+  # library documents nor the fact that the host set it. An `is_atom/1` check
+  # would not do either: `nil`, `true` and `false` are atoms and none of them is a
+  # level.
+  defp validate_level(config) do
+    case fetch(config, :level, :all) do
+      value when value in @levels ->
+        :ok
+
+      value ->
+        {:error, {:level, ":level must be one of #{inspect(@levels)}, got: #{inspect(value)}"}}
+    end
+  end
+
+  # `Buffer` caps its queue at `max_buffer_size`, dropping the oldest row to make
+  # room. So a `batch_size` above that cap is a size trigger that can never fire:
+  # the queue is held below it, and every row past the cap is discarded for a
+  # reason that has nothing to do with ClickHouse. In a `discarded` count that is
+  # indistinguishable from the database being too slow, which is the one thing the
+  # counter has to be able to tell a host.
+  #
+  # Equal is fine — that is a host asking for the smallest batch it can get, and
+  # the trigger still fires.
+  defp validate_batch_fits_buffer(batch_size, max)
+       when batch_size > max do
+    {:error,
+     {:batch_size,
+      ":batch_size (#{batch_size}) cannot exceed :max_buffer_size (#{max}); " <>
+        "the buffer is capped at :max_buffer_size, so the batch trigger could never " <>
+        "fire and rows would be discarded rather than written"}}
+  end
+
+  defp validate_batch_fits_buffer(_batch_size, _max), do: :ok
 
   defp positive_integer(config, key, default) do
     case fetch(config, key, default) do

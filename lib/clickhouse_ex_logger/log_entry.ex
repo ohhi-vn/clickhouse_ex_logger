@@ -42,8 +42,11 @@ defmodule ClickhouseExLogger.LogEntry do
   it deduplicates by *sorting key*. `id` is therefore here so you can
   cross-reference a specific row (from a `discarded` count, an error message,
   or your own application logs) — not so ClickHouse will reject a duplicate.
-  Rows are ordered by `(timestamp, id)`, which is the ordering
-  `ClickhouseExLogger.Buffer` guarantees delivery in.
+
+  The table's sorting key is `timestamp` alone, which is what `order_by` generates.
+  `id` is not part of it, so `SELECT * ORDER BY id` is not the delivery order —
+  use `(timestamp, id)`, which is the order `ClickhouseExLogger.Buffer` guarantees
+  delivery in.
 
   ## `metadata` values are strings
 
@@ -71,11 +74,6 @@ defmodule ClickhouseExLogger.LogEntry do
     # success really does mean the rows are queryable — which the failure
     # reporting in ClickhouseExLogger.Buffer depends on.
     insert_opts(async_insert: 1, wait_for_async_insert: 1)
-
-    # Let ClickHouse batch the insert server-side. `wait_for_async_insert: 1`
-    # keeps the request blocking until the data is accepted, so a reported
-    # success really does mean the rows are queryable — which the failure
-    # reporting in ClickhouseExLogger.Buffer depends on.
   end
 
   # `public?: true` is required, not decorative: Ash 3 makes attributes private

@@ -41,7 +41,8 @@ defmodule ClickhouseExLogger.Utils do
       $ bin/my_app eval "ClickhouseExLogger.Utils.migrate()"
       $ bin/my_app eval "ClickhouseExLogger.Utils.migrate(dry_run: true)"
   """
-  @spec migrate(keyword()) :: {:ok, %{applied: [module()], skipped: [module()]}} | {:error, term()}
+  @spec migrate(keyword()) ::
+          {:ok, %{applied: [module()], skipped: [module()]}} | {:error, term()}
   def migrate(opts \\ []) do
     Code.ensure_loaded!(ClickhouseExLogger.Repo)
 

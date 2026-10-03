@@ -99,6 +99,34 @@ defmodule ClickhouseExLogger.MigrationTest do
     Migration.setup(opts)
   end
 
+  describe "setup/1 with a database name the server would reject" do
+    test "returns a diagnosable failure instead of raising" do
+      # A perfectly ordinary name for a host to write — an environment suffix is a
+      # dot — which ClickHouse will not take as an unquoted identifier. `setup/1`'s
+      # contract is `{:error, reason}`, and both entry points have an actionable
+      # message waiting for a reason: the Mix task's checklist of things to check,
+      # and the release function's advice about which config key to fix. A raise
+      # bypasses both and leaves the host to read a dependency's exception.
+      original = Application.fetch_env!(:clickhouse_ex_logger, ClickhouseExLogger.Repo)
+
+      Application.put_env(
+        :clickhouse_ex_logger,
+        ClickhouseExLogger.Repo,
+        Keyword.put(original, :database, "app.production")
+      )
+
+      restart_repo_connection()
+
+      on_exit(fn ->
+        Application.put_env(:clickhouse_ex_logger, ClickhouseExLogger.Repo, original)
+        restart_repo_connection()
+      end)
+
+      assert {:error, reason} = Migration.setup([])
+      assert reason =~ "app.production"
+    end
+  end
+
   defp schema_migrations do
     TestServer.query!(
       "SELECT version FROM #{TestServer.database()}.schema_migrations ORDER BY version"

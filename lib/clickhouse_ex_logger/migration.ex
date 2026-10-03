@@ -143,11 +143,26 @@ defmodule ClickhouseExLogger.Migration do
 
   defp ensure_database(false) do
     database = ClickhouseExLogger.Repo.database() || "default"
-    :ok = AshClickhouse.Identifier.validate_database!(database)
 
-    case AshClickhouse.Connection.query(@bootstrap_name, create_database_sql(database)) do
-      {:ok, _result} -> :ok
-      {:error, reason} -> {:error, reason}
+    # `AshClickhouse.Identifier` has a bang validator that raises, and using it here
+    # meant a name the server would not accept escaped `setup/1` as an exception
+    # rather than arriving as the `{:error, reason}` both callers are written to
+    # report. That cost each entry point its own actionable message: the Mix task's
+    # checklist of what to check, and the release function's advice about which
+    # config key to fix. A host cannot act on a dependency's exception.
+    #
+    # `valid_identifier?/1` is the same test the bang validator performs.
+    if AshClickhouse.Identifier.valid_identifier?(database) do
+      case AshClickhouse.Connection.query(@bootstrap_name, create_database_sql(database)) do
+        {:ok, _result} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error,
+       "invalid ClickHouse database name: #{inspect(database)}. It must be an " <>
+         "unquoted identifier — letters, digits and underscores, starting with a " <>
+         "letter or underscore. Set it with `config :clickhouse_ex_logger, " <>
+         "ClickhouseExLogger.Repo, database: \"...\"`."}
     end
   end
 

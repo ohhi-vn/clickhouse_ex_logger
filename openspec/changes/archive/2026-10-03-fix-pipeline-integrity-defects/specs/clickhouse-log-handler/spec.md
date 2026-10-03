@@ -1,13 +1,6 @@
-# Clickhouse Log Handler
+# Spec Delta
 
-## Purpose
-
-Defines how Elixir `Logger` events are turned into durable, queryable rows in
-ClickHouse: handler registration and configuration, the mapping from a log event
-to a table row, buffered batched delivery, and the behaviour of the system when
-ClickHouse is slow, overloaded, or unreachable.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Handler registration and lifecycle
 
@@ -81,6 +74,7 @@ buffer without discarding events that were accepted.
 - **WHEN** any unexpected error occurs while processing one event
 - **THEN** the process that emitted the log is not crashed and does not receive
   an exception
+
 ### Requirement: Event configuration
 
 The system SHALL accept a level threshold and a batching configuration at
@@ -141,6 +135,7 @@ maximum configures them equal, which the system SHALL accept.
   application logs at `:info`
 - **THEN** that event is not accepted into the buffer and no row is written for
   it
+
 ### Requirement: Event-to-row mapping
 
 The system SHALL map each accepted log event to exactly one row containing the
@@ -267,6 +262,7 @@ that a query testing for rows with no module finds exactly those rows.
   report data, such as an improper list
 - **THEN** the row stores the message in its inspected textual form and the
   mapping returns rather than raising
+
 ### Requirement: Buffered batched delivery
 
 The system SHALL accumulate accepted events in memory and deliver them to
@@ -333,27 +329,6 @@ while delivering nothing.
   are buffered
 - **THEN** the buffered events are written by that outstanding write or not at
   all, and no second write runs alongside it
-### Requirement: Non-blocking behaviour under load
-
-The process that logs an event SHALL NOT block on buffer state, and the system
-SHALL bound its memory use by never holding more than the configured maximum
-buffer size. When the buffer is full, the system SHALL drop the oldest buffered
-event to make room for the newest, rather than growing without bound or blocking
-the caller.
-
-#### Scenario: Buffer at capacity
-
-- **WHEN** an event arrives while the buffer already holds the configured
-  maximum number of events
-- **THEN** the oldest buffered event is discarded, the new event is retained,
-  and the logging call still returns immediately
-
-#### Scenario: Sustained overload
-
-- **WHEN** logging outpaces ClickHouse delivery for a sustained period
-- **THEN** the buffer size stays at or below the configured maximum, the
-  process logging events is never blocked, and the count of discarded events is
-  observable
 
 ### Requirement: Failure handling and observability
 
@@ -443,6 +418,7 @@ then tell a connection failure from a rejected statement.
 - **THEN** the system does not report zeroed counts as though the system were not
   running, because zeroed counts with an inactive marker are indistinguishable
   from a system that never started
+
 ### Requirement: ClickHouse table contract
 
 The system SHALL define a table, named `logs` in the configured database, whose
@@ -575,72 +551,6 @@ failure SHALL be handled per the failure-handling requirement until it does.
 - **THEN** the writes are rejected by ClickHouse, the failure is reported and
   counted as lost per the failure-handling requirement, and the reported reason
   names the missing column
-### Requirement: Published library identity
-
-The library SHALL be published as the hex package `clickhouse_ex_logger`, built
-as the OTP application `:clickhouse_ex_logger`, with all of its public modules
-under the `ClickhouseExLogger` namespace. A host SHALL be able to declare the
-dependency, configure the connection, start the pipeline, create the schema, and
-read pipeline statistics using only those names, without reference to any other
-library name.
-
-The connection configuration SHALL be read from the `:clickhouse_ex_logger`
-application environment, keyed by the repo module, so that
-`config :clickhouse_ex_logger, ClickhouseExLogger.Repo` is the single place a host
-states its ClickHouse connection.
-
-The system SHALL provide the schema migration as `mix clickhouse_ex_logger.migrate`
-for a host with Mix, and as a function in the `ClickhouseExLogger` namespace that
-a host calls from a running release, and those SHALL be the only supported ways
-for a host to create the schema — consistent with the table contract requirement,
-which forbids delegating to the data layer's generic task.
-
-Both entry points SHALL be documented in the library's introduction, in the
-function's own documentation, and in the Mix task's documentation, so that a host
-reaches the release path from whichever entry point it already knows.
-
-The system SHALL NOT retain the previous application name, module namespace,
-configuration key, or Mix task name in any form. A host still using a previous
-name SHALL be given a diagnosable failure rather than a silently absent
-configuration.
-
-#### Scenario: Host configures, starts, and migrates using the documented names
-
-- **WHEN** a host adds `{:clickhouse_ex_logger, "~> 0.1"}` to its dependencies,
-  configures `config :clickhouse_ex_logger, ClickhouseExLogger.Repo`, adds
-  `ClickhouseExLogger.Repo` to its supervision tree, runs
-  `mix clickhouse_ex_logger.migrate`, and calls
-  `ClickhouseExLogger.Handler.install/2`
-- **THEN** the `logs` table exists, subsequent log events reach it, and the
-  handler reports itself active
-
-#### Scenario: Host migrates from a release using only the documented names
-
-- **WHEN** a host whose release carries no Mix runs the documented release
-  migration function against the same configuration key
-- **THEN** the `logs` table is created and the release reports the schema as up
-  to date on a subsequent run, with no reference to any other library name
-
-#### Scenario: Operator reads statistics under the renamed module
-
-- **WHEN** an operator calls the buffer's statistics function through the
-  `ClickhouseExLogger` namespace
-- **THEN** the documented counters are returned, with the same keys and meanings
-  as before the rename
-
-#### Scenario: Host still configures the previous application name
-
-- **WHEN** a host sets connection configuration under the previous application
-  name and key instead of `:clickhouse_ex_logger`
-- **THEN** the system does not silently fall back to a default ClickHouse
-  connection, and the failure names the missing configuration rather than
-  appearing as an unreachable database
-
-#### Scenario: Host invokes the previous Mix task name
-
-- **WHEN** a host runs the migration command under the previous task name
-- **THEN** Mix reports that no such task exists, rather than running a migration
-  under a name the library no longer supports
 
 ### Requirement: Published package contents
 
@@ -722,182 +632,3 @@ test build and are not part of the library a host consumes.
 - **WHEN** the package manifest is inspected
 - **THEN** it lists the library sources and its runtime assets, and does not list the
   test-only support sources, coverage output, or the project's change records
-### Requirement: Published package metadata
-
-The package SHALL declare a description, a licence, and a set of links identifying
-where the project lives, so that a person browsing the package page or the
-documentation can reach the source, report a problem, and read the introduction
-without knowing anything about the repository in advance.
-
-Every link the package declares SHALL resolve to a publicly reachable location that
-the project actually maintains. A link SHALL NOT be declared for a resource the
-project does not publish, such as a discussion page or a hosted changelog, because
-the metadata is a claim that the destination exists and a dead link is a broken
-claim.
-
-The documentation home page SHALL be the project's introduction, so that a reader
-arriving at the documentation site is given the same orientation the introduction
-gives.
-
-The package SHALL NOT declare suppression for credential scanning over paths the
-package does not ship. Suppression exists to keep deliberate test fixtures and
-certs out of the scan report; with none such shipped, declaring it would be a
-statement that the package contains credentials.
-
-#### Scenario: Person browses the package page
-
-- **WHEN** a person looks up the package on Hex
-- **THEN** a description of what the library does and its licence are shown, and a
-  link leads to the project's source repository
-
-#### Scenario: Reader follows a source link from the documentation
-
-- **WHEN** a reader follows a source link for a module or function in the published
-  documentation
-- **THEN** the link resolves to that module's or function's source in the project's
-  repository
-
-#### Scenario: Reader arrives at the documentation site
-
-- **WHEN** a reader opens the published documentation
-- **THEN** the home page is the project's introduction, including its installation
-  and quick-start content
-
-#### Scenario: Declared links are checked against what the project maintains
-
-- **WHEN** the package's declared links are compared against the project's
-  repository
-- **THEN** every declared link has a corresponding location that exists, and no link
-  is declared for a location the project does not host
-
-#### Scenario: Credential scanning is not suppressed
-
-- **WHEN** the package's metadata is inspected
-- **THEN** no path is excluded from credential scanning, because the package ships
-  no credentials, test fixtures, or certificates that would need excluding
-
-### Requirement: Published package documentation
-
-The library SHALL publish documentation to its documentation host alongside the
-package, and that documentation SHALL be built from the sources in the release it
-describes. Documentation describing code that was not shipped would send a reader
-to functions the installed version does not have.
-
-The documentation build SHALL be runnable from a clean checkout through the standard
-Mix documentation task, so that a publisher verifies the documentation locally
-before releasing instead of relying on the publishing service to report a broken
-build afterwards.
-
-The documentation tooling SHALL NOT be a runtime dependency of the library, so that a
-host's compiled release does not carry a tool the host never calls.
-
-The project SHALL state its release procedure in the repository, including how to
-inspect the built package's file list before publishing, so that the manifest
-requirement above is checked by a repeatable step rather than by inspection at the
-moment of release.
-
-#### Scenario: Publisher verifies documentation before releasing
-
-- **WHEN** a publisher builds the documentation from a clean checkout
-- **THEN** the documentation task completes successfully and produces a local site
-  containing the library's modules and the introduction as its home page
-
-#### Scenario: Documentation is published with the package
-
-- **WHEN** the package is published to Hex
-- **THEN** the documentation for that exact version is available on the
-  documentation host without the publisher taking a separate manual step
-
-#### Scenario: Host is not burdened by the documentation tooling
-
-- **WHEN** a host application depends on the library
-- **THEN** the documentation tooling is absent from the host's runtime dependency
-  tree and from the host's release
-
-#### Scenario: Publisher inspects the built package before publishing
-
-- **WHEN** a publisher follows the documented release procedure
-- **THEN** the procedure includes building the package, listing the files it contains,
-  and confirming the priv directory's migration files are among them, before the
-  publishing step is run
-
-### Requirement: Migration identity survives the rename
-
-The migration that creates the `logs` table SHALL be tracked in ClickHouse's
-`schema_migrations` table under the same version it has always used. Renaming the
-migration module SHALL NOT change that version, and the version SHALL NOT be
-changed to reflect the library's rename.
-
-The system SHALL therefore treat a database whose `schema_migrations` table
-already records that version as up to date, regardless of which module now
-implements the migration, and SHALL NOT re-issue the table creation statement
-against such a database.
-
-#### Scenario: Migration command runs against a database created before the rename
-
-- **WHEN** the migration command runs against a database where the `logs` table
-  was created by the previous library name and `schema_migrations` already
-  records the shipped version
-- **THEN** the command reports the schema as up to date and applies no
-  statements, leaving the existing table and its rows untouched
-
-#### Scenario: Migration is applied fresh after the rename
-
-- **WHEN** the migration command runs against a database that does not exist
-- **THEN** the table is created and the same shipped version is recorded, so a
-  later run against that database is also a no-op
-
-#### Scenario: The shipped migration version is not the rename date
-
-- **WHEN** the shipped migration is inspected after the rename
-- **THEN** its version string is unchanged from the version the library has
-  always shipped, rather than a version derived from the rename
-
-### Requirement: Node name capture is configurable
-
-The system SHALL record the node name on every row without requiring any
-configuration, and SHALL accept a handler option that turns that capture off.
-The option SHALL be a boolean and SHALL default to enabled.
-
-Disabling the option SHALL stop the value from being recorded; it SHALL NOT change
-the table's shape. The column SHALL exist either way and record no value when
-capture is disabled, so a host that turns the option off and back on does not
-require a schema migration to do so.
-
-An option value that is present but not a boolean SHALL cause registration to fail
-with an error naming that option, rather than being treated as either enabled or
-disabled.
-
-The node name SHALL be read from the running system, not from the event's
-metadata. A metadata key named `node` SHALL therefore remain user-supplied data
-and SHALL continue to appear in the row's metadata map, unchanged from before
-this option existed.
-
-#### Scenario: Node name is recorded without configuration
-
-- **WHEN** a host registers the handler with no node-related option
-- **THEN** every row written on a distributed node carries that node's name
-
-#### Scenario: Capture is disabled by option
-
-- **WHEN** a host registers the handler with node capture turned off
-- **THEN** rows are written with no value in the node field, and the node field
-  continues to exist on the table
-
-#### Scenario: Capture is re-enabled without a schema migration
-
-- **WHEN** a host registers the handler with capture disabled, then later with it
-  enabled again
-- **THEN** rows carry the node name again, with no migration run in between
-
-#### Scenario: Option value is not a boolean
-
-- **WHEN** a host registers the handler with the node-capture option set to a
-  non-boolean value
-- **THEN** registration returns an error identifying that option
-
-#### Scenario: Metadata supplies its own node key
-
-- **WHEN** an event carries user metadata with a key named `node`
-- **THEN** that key and value appear in the row's metadata map as user-supplied
-  data, and do not affect the row's node field

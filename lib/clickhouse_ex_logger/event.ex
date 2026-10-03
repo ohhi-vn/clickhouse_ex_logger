@@ -21,7 +21,7 @@ defmodule ClickhouseExLogger.Event do
   Chardata that `IO.chardata_to_string/1` refuses is inspected instead of raised
   on: bytes that are not a valid character sequence, and lists that are not
   well-formed chardata at all. `row/2` does not raise, so a message it cannot
-  turn into text is still a row.
+  turn into text is still a row — and so is a `:file` it cannot render.
 
   ## Metadata rendering
 
@@ -44,9 +44,16 @@ defmodule ClickhouseExLogger.Event do
   ## Where event fields live
 
   Depending on the OTP version, `:logger` puts the event's metadata either at the
-  top level (`%{mfa: ..., file: ..., line: ...}`) or nested under `:meta`
-  (OTP 27+, which is what you get today). Both shapes are handled; `:meta` wins
-  when both carry a key.
+  top level (`%{mfa: ..., file: ..., user_id: ...}`) or nested under `:meta`
+  (OTP 27+, which is what you get today). Both shapes are handled, and they are
+  handled by the same reader, so a row does not depend on which one produced the
+  event: an event's own fields, its user metadata, and the internal marker are all
+  resolved the same way. Where both shapes carry a key, `:meta` wins — so an event
+  carrying both shapes keeps every key rather than one shape's worth.
+
+  `:msg` and `:level` are the exception. They sit outside `:meta` on every shape, so
+  on a flat event they are the event's own message and severity and are not treated
+  as user metadata.
 
   ## Reserved metadata keys
 
@@ -58,6 +65,18 @@ defmodule ClickhouseExLogger.Event do
   `:domain` is on that list too. Elixir sets it on every message it logs
   (`[:elixir]`), so it is not user-supplied data, and storing it would add the
   same constant `term:[:elixir]` entry to every row in the table.
+
+  ## A field it cannot render is rendered, not dropped
+
+  Every field goes through the same rule, including the ones that are not the
+  message. A source-location value that cannot be turned into text — a file path
+  carrying an invalid code point, a list that is not well-formed, a value that is
+  not text at all — is stored in a deterministic textual form rather than raising,
+  because `row/2` does not raise and a lost row is worse than a rendered one.
+
+  A source location that is *absent* is recorded as no value. A `:mfa` with no
+  module gives `module: nil`, not the four characters `nil`, so `WHERE module IS
+  NULL` finds exactly those rows.
 
   ## The node name does not come from the event
 
@@ -101,6 +120,12 @@ defmodule ClickhouseExLogger.Event do
     meta ansi_color crash_reason initial_call registered_name
     report report_level time_usec
   )a
+
+  # The event's own fields that live outside `:meta` on every shape, so on a flat
+  # event they are structure rather than user data. `metadata/1` excludes these
+  # from its top-level read; they are not part of `@event_keys`, which is the list
+  # that keeps Erlang's fields out of *nested* metadata.
+  @flat_only_keys ~w(msg level)a
 
   @doc """
   The metadata keys that are stored as their own columns.
@@ -172,6 +197,13 @@ defmodule ClickhouseExLogger.Event do
     match?({:ok, true}, fetch_meta(event, :clickhouse_ex_logger_internal))
   end
 
+  defp fetch_meta(event, key) do
+    case field(event, key) do
+      nil -> :error
+      value -> {:ok, value}
+    end
+  end
+
   @doc """
   Renders one metadata value as a string.
 
@@ -194,6 +226,11 @@ defmodule ClickhouseExLogger.Event do
   # under `:meta` (what OTP 27+ actually delivers, and what Elixir's
   # `Logger.metadata/1` values become). Read `meta` first and fall back, so the
   # mapping works on both.
+  #
+  # Every field is read through this one function. `metadata/1` and the internal
+  # marker used to read `:meta` directly, which is how a top-level event ended up
+  # with an empty metadata map and an internal report the handler did not
+  # recognise as its own.
   defp field(event, key) do
     case Map.get(event, :meta) do
       %{^key => value} -> value
@@ -264,7 +301,10 @@ defmodule ClickhouseExLogger.Event do
   defp source_location(event) do
     case field(event, :mfa) do
       {module, function, arity} when is_atom(module) and is_atom(function) ->
-        {inspect(module), format_mfa({module, function, arity})}
+        # Through `string_or_nil/1`, whose atom clause excludes `nil`. A `:mfa` with
+        # no module recorded the four characters `nil` here, and a query for rows
+        # with no module — `WHERE module IS NULL` — could not find them.
+        {string_or_nil(module), format_mfa({module, function, arity})}
 
       _other ->
         # `Logger.bare_log/3` and translated OTP reports may carry `:module` and
@@ -279,19 +319,36 @@ defmodule ClickhouseExLogger.Event do
 
   defp format_mfa(_mfa), do: nil
 
+  # The event's own metadata, on whichever shape the runtime delivered it.
+  #
+  # Both shapes are read and merged rather than one being preferred outright, so
+  # that an event's metadata does not depend on which OTP version produced it — and
+  # so that an event carrying both does not lose the keys only one of them has.
+  # Nested wins per key, which is the precedence the moduledoc documents.
+  #
+  # `:msg` and `:level` are excluded from the top-level read because they sit
+  # outside `:meta` on every shape, so on a flat event they are the event's own
+  # message and severity rather than user data. They are deliberately *not* added to
+  # `@event_keys`: that list is what keeps Erlang's fields out of *nested*
+  # metadata, and a user key named `:level` under `:meta` is user data.
+  #
+  # A `:meta` that is present but not a map is not a shape `:logger` produces, so
+  # it is ignored rather than crashing the mapping.
   defp metadata(event) do
-    user_meta = Map.get(event, :meta) || %{}
+    nested =
+      case Map.get(event, :meta) do
+        nested when is_map(nested) -> Map.drop(nested, @event_keys)
+        _other -> %{}
+      end
 
-    user_meta
-    |> Map.drop(@event_keys)
+    top =
+      event
+      |> Map.drop(@event_keys)
+      |> Map.drop([:meta | @flat_only_keys])
+
+    top
+    |> Map.merge(nested, fn _key, _top, nested_value -> nested_value end)
     |> Map.new(fn {key, value} -> {to_string(key), stringify(value)} end)
-  end
-
-  defp fetch_meta(event, key) do
-    case Map.get(event, :meta) do
-      %{^key => value} -> {:ok, value}
-      _other -> :error
-    end
   end
 
   defp string_or_nil(value) when is_binary(value), do: value
@@ -302,9 +359,27 @@ defmodule ClickhouseExLogger.Event do
 
   defp string_or_nil(_value), do: nil
 
-  defp charlist?(list) do
-    list != [] and Enum.all?(list, &(&1 >= 0 and &1 <= 0x10FFFF))
-  end
+  # Whether a list is character data `List.to_string/1` will accept.
+  #
+  # Total, over improper lists, and stricter than a range check. `chardata?/1`
+  # above walks cons cells for exactly this reason: `Enum.all?/2` raises on
+  # `[97 | 98]`. And the range alone is not enough — `List.to_string/1` rejects the
+  # surrogate range, which a `0..0x10FFFF` check accepts, so the predicate would
+  # pass a value the conversion then raises on. `row/2` does not raise, so the
+  # predicate has to agree with the conversion rather than merely look plausible.
+  #
+  # `[]` is character data: it is a path with no characters, not an inspected list.
+  defp charlist?([]), do: true
+
+  defp charlist?([head | tail]), do: charlist_element?(head) and charlist?(tail)
+  defp charlist?(_improper_tail), do: false
+
+  defp charlist_element?(element) when is_integer(element),
+    do: element in 0..0xD7FF or element in 0xE000..0x10FFFF
+
+  defp charlist_element?(element) when is_binary(element), do: charlist?(element)
+  defp charlist_element?(element) when is_list(element), do: charlist?(element)
+  defp charlist_element?(_element), do: false
 
   defp integer_or_nil(value) when is_integer(value), do: value
   defp integer_or_nil(_value), do: nil

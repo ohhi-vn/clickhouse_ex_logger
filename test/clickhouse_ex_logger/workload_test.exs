@@ -145,7 +145,6 @@ defmodule ClickhouseExLogger.WorkloadTest do
 
       assert settled.buffered == 0
       assert settled.delivered > stalled.delivered
-
     end
   end
 
@@ -156,6 +155,12 @@ defmodule ClickhouseExLogger.WorkloadTest do
       TestContainer.pause()
       hammer()
 
+      # Everything the buffer accepted is in delivered, discarded, lost, or still
+      # held. Read before removal, because the counters go with the process — and
+      # this is what makes "it could not write them" a claim rather than a hope.
+      before = Buffer.stats(Buffer)
+      assert before.accepted >= before.delivered + before.discarded + before.lost
+
       # `uninstall/1` gives its own flush 5s and `terminate/2` gives the final
       # write another 5s. Unbounded, this is ten 1000-row chunks at 15s each.
       {elapsed, _result} = :timer.tc(fn -> Handler.uninstall(handler_id) end)
@@ -165,13 +170,26 @@ defmodule ClickhouseExLogger.WorkloadTest do
              "uninstall/1 took #{elapsed_ms}ms with ClickHouse paused"
 
       refute Process.whereis(Buffer)
+
+      # Nothing was double-written on the way out. `terminate/2` waits for the
+      # outstanding write rather than starting a second one alongside it, so the
+      # table can hold at most what the buffer accepted — never more.
+      TestContainer.unpause()
+      Process.sleep(250)
+
+      assert String.to_integer(stored_count()) <= before.accepted
     end
+  end
+
+  defp stored_count do
+    ClickhouseExLogger.TestServer.query!("SELECT count() FROM logs") |> String.trim()
   end
 
   # --- helpers ------------------------------------------------------------
 
   defp install!(options) do
-    handler_id = String.to_atom("clickhouse_ex_logger_workload_#{System.unique_integer([:positive])}")
+    handler_id =
+      String.to_atom("clickhouse_ex_logger_workload_#{System.unique_integer([:positive])}")
 
     # `Handler.install/2` is idempotent by design: if a buffer is already running
     # it is reused, options and counters included. That is right for an
@@ -270,8 +288,4 @@ defmodule ClickhouseExLogger.WorkloadTest do
   end
 
   defp settled, do: eventually(&at_rest?/1, attempts: 1_200)
-
-  defp stored_count do
-    ClickhouseExLogger.TestServer.query!("SELECT count() FROM logs") |> String.trim()
-  end
 end

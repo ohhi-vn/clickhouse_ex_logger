@@ -10,6 +10,7 @@ defmodule ClickhouseExLogger.BufferTest do
   use ClickhouseExLogger.Case
 
   alias ClickhouseExLogger.Buffer
+  alias ClickhouseExLogger.CaptureHandler
 
   @moduletag :capture_log
 
@@ -85,6 +86,24 @@ defmodule ClickhouseExLogger.BufferTest do
       assert stats.delivered == 0
       assert stats.discarded == 0
       assert stats.failed == 0
+      assert stats.active?
+    end
+
+    test "does not report a busy buffer as one that never started" do
+      # The buffer answers `:stats` from its own process and never blocks on
+      # ClickHouse, so it has to be suspended for the call to time out. What
+      # matters is that a buffer which exists but did not answer is not reported
+      # the same way as one that is not running: a zeroed report marked inactive is
+      # indistinguishable from a system that never accepted anything.
+      server = start_buffer(batch_size: 100, flush_interval_ms: 60_000)
+      enqueue(server, 3)
+      eventually(server, &(&1.buffered == 3))
+
+      :ok = :sys.suspend(server)
+      on_exit(fn -> if Process.alive?(server), do: :sys.resume(server) end)
+
+      stats = Buffer.stats(server)
+
       assert stats.active?
     end
   end
@@ -316,29 +335,129 @@ defmodule ClickhouseExLogger.BufferTest do
     end
   end
 
-  describe "the write monitor" do
-    test "ignores a DOWN that matches the write in flight" do
-      # `start_write/1` spawn-monitors the process doing the insert. The result
-      # message carries everything the buffer needs, so the `:DOWN` is noise; and
-      # Erlang does not order a message against a signal, so the `:DOWN` can
-      # arrive while `write_ref` is still set. Sending one directly is the only
-      # way to reach that clause.
-      server = start_buffer(batch_size: 1_000, flush_interval_ms: 60_000)
-      enqueue(server, 1)
+  describe "a write that dies without reporting an outcome" do
+    # `start_write/1` spawn-monitors the process doing the insert and then waits
+    # for a `{ref, result}` message. That process can die before it sends one:
+    # `clickhouse` 0.32.0 raises from inside a query for responses its error-type
+    # lookup does not recognise, and names an undefined `ClickHouse.NetworkError`
+    # struct for `DB::NetException` bodies — neither of which is in
+    # `AshClickhouse.Connection`'s rescue list, so both escape the insert.
+    #
+    # A row the writer cannot encode is the same shape of failure reachable from
+    # outside the library, and deterministic: `Insert.normalize/1` raises before
+    # any connection is touched, so the spawned process dies having sent nothing.
+    defp dying_row, do: %{id: Ash.UUID.generate(), level: :info, message: "never written"}
 
-      eventually(server, &(&1.buffered == 1))
-      ref = write_ref(server)
+    test "counts the abandoned batch as lost so the counters still reconcile" do
+      server = start_buffer(batch_size: 1, flush_interval_ms: 60_000)
+      Buffer.enqueue(dying_row(), server)
 
-      send(server, {:DOWN, ref, :process, self(), :killed})
+      stats = eventually(server, &(&1.failed == 1))
 
-      # Ignored rather than treated as a crash: the buffered rows survive and are
-      # still written on the next trigger.
-      assert Buffer.stats(server).buffered == 1
-      assert Buffer.stats(server).lost == 0
+      assert stats.accepted == 1
+      assert stats.delivered == 0
+      assert stats.discarded == 0
+      assert stats.lost == 1
+      assert stats.buffered == 0
+      assert stats.accepted == stats.delivered + stats.discarded + stats.lost
+      assert stored_count() == "0"
+    end
 
-      :ok = Buffer.flush(server, 5_000)
-      assert Buffer.stats(server).delivered == 1
+    test "reports the crash through the logger" do
+      CaptureHandler.install(self())
+
+      server = start_buffer(batch_size: 1, flush_interval_ms: 60_000)
+      Buffer.enqueue(dying_row(), server)
+
+      eventually(server, &(&1.failed == 1))
+
+      # Exactly one report for one failed flush, carrying the marker that keeps it
+      # out of the `logs` table. Elixir's own "raised an exception" report for the
+      # dead write process is a separate, unmarked, legitimate log line.
+      internal = Enum.filter(CaptureHandler.drain(), & &1.meta[:clickhouse_ex_logger_internal])
+      assert [event] = internal
+
+      assert event.level == :error
+      assert {:string, text} = event.msg
+      assert text =~ "ClickhouseExLogger: dropped 1 buffered log row"
+
+      # The reason an operator reads names the failure without the frames that
+      # produced it. A `KeyError` from the writer arrives as an Erlang
+      # `{:badkey, key, map}` reason, which is not an exception struct.
+      assert text =~ ~s(key "timestamp" not found)
+      refute text =~ "stacktrace"
+    end
+
+    test "keeps delivering events logged after the crash" do
+      server = start_buffer(batch_size: 1, flush_interval_ms: 60_000)
+      Buffer.enqueue(dying_row(), server)
+      eventually(server, &(&1.failed == 1))
+
+      Buffer.enqueue(row("after"), server)
+
+      stats = eventually(server, &(&1.delivered == 1))
+
+      assert stats.buffered == 0
+      assert stats.accepted == 2
+      assert stats.lost == 1
       assert stored_count() == "1"
+    end
+
+    test "does not stay wedged waiting for a message that is never coming" do
+      server = start_buffer(batch_size: 1, flush_interval_ms: 60_000)
+      Buffer.enqueue(dying_row(), server)
+      eventually(server, &(&1.failed == 1))
+
+      # `flush/1` is bounded by its call timeout, so a wedge is observable as a
+      # call that never returns rather than as a hang.
+      assert Buffer.flush(server, 1_000) == :ok
+      assert Buffer.stats(server).buffered == 0
+    end
+
+    test "recovers when the write reports normally afterwards" do
+      server = start_buffer(batch_size: 1, flush_interval_ms: 60_000)
+      Buffer.enqueue(dying_row(), server)
+      eventually(server, &(&1.failed == 1))
+
+      enqueue(server, 3)
+
+      stats = eventually(server, &(&1.delivered == 3))
+
+      assert stats.accepted == 4
+      assert stats.failed == 1
+      assert stats.accepted == stats.delivered + stats.discarded + stats.lost
+      assert stored_count() == "3"
+    end
+
+    test "treats an unrecognised result as a failed flush rather than crashing" do
+      # `{:error, message}` is the shape this module's old `@spec` advertised and
+      # its implementation never returned. It is the most plausible shape for a
+      # future change to start returning, and the one the buffer must survive.
+      server = start_buffer(batch_size: 1_000, flush_interval_ms: 60_000)
+      ref = fake_in_flight_write(server, 2)
+
+      send(server, {ref, {:error, "a message with no committed count"}})
+
+      stats = Buffer.stats(server)
+
+      assert Process.alive?(server)
+      assert stats.failed == 1
+      assert stats.lost == 2
+      assert stats.delivered == 0
+    end
+
+    test "reports an unrecognised result as an insert failure" do
+      CaptureHandler.install(self())
+
+      server = start_buffer(batch_size: 1_000, flush_interval_ms: 60_000)
+      ref = fake_in_flight_write(server, 1)
+
+      send(server, {ref, :a_shape_nobody_agreed_on})
+
+      internal = Enum.filter(CaptureHandler.drain(), & &1.meta[:clickhouse_ex_logger_internal])
+      assert [event] = internal
+      assert {:string, text} = event.msg
+      assert text =~ "unexpected insert result"
     end
   end
 
@@ -353,6 +472,52 @@ defmodule ClickhouseExLogger.BufferTest do
 
       refute Process.alive?(server)
       assert stored_count() == "2"
+    end
+
+    test "does not start a second write while one is under way" do
+      # The ordering guarantee is only worth anything if it holds to the end of the
+      # process's life. A shutdown that wrote the queued rows itself would run two
+      # inserts concurrently — this one, and the one the outstanding write is still
+      # doing — and neither could be ordered against the other.
+      server =
+        start_buffer(batch_size: 4_000, flush_interval_ms: 60_000, max_buffer_size: 10_000)
+
+      enqueue(server, 4_000, "slow")
+      eventually(server, &(&1.buffered == 0))
+
+      # Rows pile up behind the write that is running.
+      enqueue(server, 500, "queued")
+      eventually(server, &(&1.buffered == 500))
+
+      GenServer.stop(server, :normal, 5_000)
+
+      refute Process.alive?(server)
+
+      # Only the outstanding write's rows landed, and nothing was written twice.
+      assert stored_count() == "4000"
+    end
+
+    test "writes what it holds even while other processes keep logging" do
+      # `bounded_flush/1` is a selective receive, so what else is in the mailbox
+      # matters: the final flush has to match its own write's reference rather than
+      # the first two-element message it sees. Uninstallation is exactly when that
+      # happens — the handler comes off, and other processes are still logging into
+      # a buffer that is on its way out.
+      server =
+        start_buffer(batch_size: 10_000, flush_interval_ms: 60_000, max_buffer_size: 100)
+
+      enqueue(server, 2)
+      eventually(server, &(&1.buffered == 2))
+
+      noise = Task.async(fn -> Enum.each(1..25, &Buffer.enqueue(row("noise-#{&1}"), server)) end)
+      Task.await(noise)
+
+      GenServer.stop(server, :normal, 10_000)
+
+      refute Process.alive?(server)
+
+      # Everything the buffer held at shutdown was written, once.
+      assert stored_count() == "27"
     end
   end
 
@@ -401,10 +566,16 @@ defmodule ClickhouseExLogger.BufferTest do
     end
   end
 
-  # The reference the buffer is monitoring the in-flight write with. `:sys` rather
-  # than a cast, because the field is private state.
-  defp write_ref(server) do
-    %{write_ref: ref} = :sys.get_state(server)
+  # Puts the state a write under way would have left, without starting one, and
+  # returns the reference its result would carry. `:sys` rather than a cast,
+  # because the fields are private state.
+  defp fake_in_flight_write(server, in_flight) do
+    ref = make_ref()
+
+    :sys.replace_state(server, fn state ->
+      %{state | write_ref: ref, write_monitor: make_ref(), in_flight: in_flight}
+    end)
+
     ref
   end
 end

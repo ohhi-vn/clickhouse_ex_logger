@@ -210,7 +210,8 @@ defmodule ClickhouseExLogger.TestContainer do
 
   defp started, do: :persistent_term.get(__MODULE__, nil) || raise(not_started())
 
-  defp not_started do    "the ClickHouse test container has not been started; " <>
+  defp not_started do
+    "the ClickHouse test container has not been started; " <>
       "test/test_helper.exs starts it before the suite runs"
   end
 

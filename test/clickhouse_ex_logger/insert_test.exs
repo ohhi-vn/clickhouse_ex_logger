@@ -23,6 +23,11 @@ defmodule ClickhouseExLogger.InsertTest do
 
   setup do
     truncate_logs!()
+
+    # This module repoints the shared repo connection; put it back whatever happens,
+    # so a failure here cannot leave later modules without one.
+    on_exit(&restart_repo_connection/0)
+
     :ok
   end
 
@@ -46,7 +51,8 @@ defmodule ClickhouseExLogger.InsertTest do
     end
 
     test "encodes a DateTime at full microsecond precision" do
-      assert {:ok, 1} = Insert.insert([row("naive", %{timestamp: ~U[2026-01-02 03:04:05.000006Z]})])
+      assert {:ok, 1} =
+               Insert.insert([row("naive", %{timestamp: ~U[2026-01-02 03:04:05.000006Z]})])
 
       assert TestServer.query!("SELECT toString(timestamp) FROM logs") |> String.trim() ==
                "2026-01-02 03:04:05.000006"
@@ -106,6 +112,53 @@ defmodule ClickhouseExLogger.InsertTest do
 
       assert {:error, message, 0} = Insert.insert([row("absent")])
       assert message =~ "UNKNOWN_DATABASE"
+
+      # The reason an operator reads is the server's text, not an inspection of the
+      # client's error struct. `inspect/1` happens to *contain* the server's text
+      # too, so matching on the text alone does not tell the two apart — reading a
+      # `%ClickHouse.DatabaseError{…}` to find out why your logs stopped is not a
+      # diagnosable failure.
+      refute inspect_error_struct?(message)
+    end
+
+    test "reports the client's own message when the server cannot be reached" do
+      # Nothing is listening on this port, so the client returns a connection error
+      # struct. The clause in `describe/1` that matched only a *raised* wrapped
+      # error never fired for this, which is the ordinary path for an unreachable
+      # server — the most common failure a host has to diagnose.
+      original = Application.fetch_env!(:clickhouse_ex_logger, ClickhouseExLogger.Repo)
+
+      Application.put_env(
+        :clickhouse_ex_logger,
+        ClickhouseExLogger.Repo,
+        Keyword.put(original, :url, "http://127.0.0.1:1")
+      )
+
+      restart_repo_connection()
+
+      on_exit(fn ->
+        Application.put_env(:clickhouse_ex_logger, ClickhouseExLogger.Repo, original)
+        restart_repo_connection()
+      end)
+
+      assert {:error, message, 0} = Insert.insert([row("unreachable")])
+
+      assert is_binary(message)
+      refute inspect_error_struct?(message)
+    end
+
+    test "reports the client's own message when the connection is gone" do
+      # The connection is registered per repo module, so stopping it leaves the name
+      # resolvable but the client's state table behind. The client answers with a
+      # bare string rather than an error struct, which is the other shape
+      # `describe/1` has to pass through unchanged.
+      stop_repo_connection()
+
+      assert {:error, message, 0} = Insert.insert([row("no-connection")])
+
+      assert is_binary(message)
+      assert String.trim(message) != ""
+      refute inspect_error_struct?(message)
     end
   end
 
@@ -130,11 +183,7 @@ defmodule ClickhouseExLogger.InsertTest do
   end
 
   defp restart_repo_connection do
-    try do
-      AshClickhouse.Connection.stop(ClickhouseExLogger.Repo)
-    catch
-      :exit, _reason -> :ok
-    end
+    stop_repo_connection()
 
     {:ok, conn} =
       AshClickhouse.Connection.start_link(
@@ -144,5 +193,22 @@ defmodule ClickhouseExLogger.InsertTest do
     Process.unlink(conn)
 
     :ok
+  end
+
+  defp stop_repo_connection do
+    try do
+      AshClickhouse.Connection.stop(ClickhouseExLogger.Repo)
+    catch
+      :exit, _reason -> :ok
+    end
+
+    :ok
+  end
+
+  # Whether a message is an inspected struct rather than a reason. A struct's
+  # `inspect/1` output starts with `%Module{`, which no client or server message
+  # does.
+  defp inspect_error_struct?(message) do
+    String.starts_with?(String.trim_leading(message), "%")
   end
 end

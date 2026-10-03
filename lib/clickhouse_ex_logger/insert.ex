@@ -7,7 +7,7 @@ defmodule ClickhouseExLogger.Insert do
   The design calls for the data layer's batched insert, and this module uses the
   data layer's own building blocks for it — but it cannot use
   `Ash.bulk_create/4`, because in `ash_clickhouse` 0.7.3 that path does not work.
-  Three separate defects stand in the way, all verified against the installed
+  Two separate defects stand in the way, both verified against the installed
   versions (`ash_clickhouse` 0.7.3, `clickhouse` 0.32.0, ClickHouse 26.9):
 
   1. **`Insert.insert_opts/2` leaks Ash's internal options into the client.**
@@ -25,7 +25,8 @@ defmodule ClickhouseExLogger.Insert do
 
   This module therefore keeps the data layer responsible for everything
   structural — the qualified table name, the column list and its order, and the
-  value encoding — and works around exactly the three points above.
+  value encoding — and works around exactly the two points above. The second is
+  worked around in `normalize/1`, below.
 
   ## What that gives up, and what it does not
 
@@ -64,8 +65,8 @@ defmodule ClickhouseExLogger.Insert do
   @doc """
   Inserts `rows` (row maps shaped like `ClickhouseExLogger.Event.row/2`).
 
-  Returns `{:ok, committed}`, `{:error, message}`, or `{:error, message, committed}`,
-  where `committed` is how many rows ClickHouse accepted.
+  Returns `{:ok, committed}` or `{:error, message, committed}`, where `committed` is
+  how many rows ClickHouse accepted.
 
   That count is not decoration. One flush is chunked at `#{@chunk_size}` rows and
   stops at the first chunk that fails, but the chunks before it are already
@@ -73,10 +74,16 @@ defmodule ClickhouseExLogger.Insert do
   `{:error, message}` would force the caller to assume a failed flush wrote
   nothing, and it would be wrong by exactly the rows that landed.
 
+  `committed` is always present, including for a failure, and is `0` for a flush
+  that failed on its first chunk. There is deliberately no two-element
+  `{:error, message}` shape: `ClickhouseExLogger.Buffer` tallies a result against
+  these two clauses, and a shape it has no clause for raises inside the only
+  process that writes logs.
+
   Later chunks are not attempted once one fails.
   """
   @spec insert([ClickhouseExLogger.Event.row()]) ::
-          {:ok, non_neg_integer()} | {:error, String.t()} | {:error, String.t(), non_neg_integer()}
+          {:ok, non_neg_integer()} | {:error, String.t(), non_neg_integer()}
   def insert([]), do: {:ok, 0}
 
   def insert(rows) when is_list(rows) do
@@ -128,7 +135,18 @@ defmodule ClickhouseExLogger.Insert do
     end)
   end
 
-  defp describe(%AshClickhouse.Error.ClickhouseError{message: message}), do: message
+  # `AshClickhouse.Connection.insert_rows/4` wraps only an exception it rescued. When
+  # the client *returns* an error — the ordinary path for an unreachable server or a
+  # rejected statement — the raw `ClickHouse` error struct comes through
+  # unnormalised, so these are the shapes that actually reach here. Every one of them
+  # carries the server's or the client's own sentence in `:message`.
+  #
+  # Extracting that field is what turns
+  # `%ClickHouse.DatabaseError{code: "81", message: "…", meta: %{summary: "…"}}` into
+  # a line an operator can act on. The whole struct also *contains* the server's text,
+  # so anything that only matches on that text cannot tell the two apart — and a
+  # connection failure is the failure a host most needs to read.
+  defp describe(%{message: message}) when is_binary(message), do: String.trim(message)
   defp describe(reason) when is_binary(reason), do: reason
   defp describe(reason), do: inspect(reason)
 end

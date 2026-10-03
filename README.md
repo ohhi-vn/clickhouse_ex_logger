@@ -41,6 +41,23 @@ Without the check it would fall back to `http://localhost:8123` and quietly
 write your logs somewhere you did not choose — or report every flush as failed,
 which looks like a ClickHouse outage rather than a configuration mistake.
 
+**If your build warns about the domain**, tell Ash where it is:
+
+```
+warning: Domain ClickhouseExLogger.Domain is not present in config :clickhouse_ex_logger, ash_domains: []
+```
+
+Name it in *your* configuration:
+
+```elixir
+config :clickhouse_ex_logger, ash_domains: [ClickhouseExLogger.Domain]
+```
+
+This is your line, not one this library can set for you. Mix evaluates only the
+current project's `config/`, so a dependency's own configuration is never read —
+which is why this library ships without its `config/` rather than relying on it to
+reach you.
+
 **2. Create the schema.** Run this from your application *before* you attach the
 handler, so the first flush has somewhere to go.
 

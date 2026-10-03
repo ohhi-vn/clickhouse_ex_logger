@@ -22,6 +22,14 @@ defmodule ClickhouseExLogger.Buffer do
       pipeline that queues behind an unreachable database turns a downstream
       outage into an upstream memory leak.
 
+    * **A write is always accounted for.** A batch is tallied when the insert
+      reports an outcome *or* when the process performing it dies without
+      reporting one. The second case is not hypothetical: the `clickhouse` client
+      raises from inside a query for some responses, and those raises escape the
+      data layer's rescue. A buffer that waited for a result that was never coming
+      would stop writing entirely while still reporting itself active, so the
+      monitor that reports the write's death is handled as a failed flush.
+
   ## `batch_size` is a trigger, not a cap
 
   When the buffer reaches `batch_size` rows, or the flush interval elapses,
@@ -98,15 +106,28 @@ defmodule ClickhouseExLogger.Buffer do
   Returns the current counters.
 
   `active?` is `true` whenever this call succeeds, i.e. whenever the buffer is
-  running and accepting rows. See the module doc for the rest.
+  running and accepting rows.
 
-  Returns zeroed counters rather than raising when the buffer is not running, so
-  an operator's dashboard does not go down with the logger.
+  Returns zeroed counters with `active?: false` when the buffer is not running, so
+  an operator's dashboard does not go down with the logger. It does **not** report
+  that for a buffer that exists but did not answer in time: a timeout means the
+  process is there and busy, and marking it inactive would tell an operator a
+  delivering system is idle. The counters read zero in that case because they could
+  not be read at all — treat `active?: true` with all-zero counters as "ask again",
+  not as "nothing has happened".
+
+  See the module doc for the rest.
   """
   @spec stats(GenServer.server()) :: stats()
   def stats(server \\ @name) do
     GenServer.call(server, :stats)
   catch
+    # The call timed out. `GenServer.call/3` wraps the call it gave up on, so this
+    # is the one reason that means "the server is there and did not answer" rather
+    # than "there is no server". See the `@doc`.
+    :exit, {:timeout, _call} -> unanswered_stats()
+    # `:noproc`, a server that exited normally, one that crashed — in every case
+    # there is no buffer to ask.
     :exit, _reason -> empty_stats()
   end
 
@@ -117,7 +138,12 @@ defmodule ClickhouseExLogger.Buffer do
   `batch_size` was not reached. Used when the handler is removed, so that logs
   already accepted are not silently thrown away, and by tests.
 
-  Returns `:ok` once the buffer is empty and no write is outstanding.
+  Returns `:ok` once the buffer is empty and no write is outstanding — **or** once
+  the call's own `timeout` ran out, because the two are not distinguishable from
+  the return value. This function is therefore not a way to ask whether the buffer
+  drained. What decides the fate of rows still held is `terminate/2`, which every
+  stop passes through: it waits for any outstanding write and makes one final
+  bounded attempt, within a fixed budget.
   """
   @spec flush(GenServer.server(), timeout()) :: :ok
   def flush(server \\ @name, timeout \\ 5_000) do
@@ -143,6 +169,7 @@ defmodule ClickhouseExLogger.Buffer do
       rows: :queue.new(),
       timer: nil,
       write_ref: nil,
+      write_monitor: nil,
       in_flight: 0,
       waiting: [],
       accepted: 0,
@@ -196,40 +223,101 @@ defmodule ClickhouseExLogger.Buffer do
     state =
       state
       |> tally(result)
-      |> Map.merge(%{write_ref: nil, in_flight: 0})
+      |> clear_write()
       |> flush_now()
 
     {:noreply, schedule_flush(reply_when_drained(state))}
   end
 
-  # `spawn_monitor/1` also delivers a `:DOWN` for every write. The result message
-  # already told us everything we need, so ignore the monitor notification.
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{write_ref: ref} = state) do
-    {:noreply, state}
+  # A write that died without sending a result. Nothing is known to have been
+  # committed, so the whole batch is lost — but it is lost *accounted*, and the
+  # buffer returns to service.
+  #
+  # This is the case `spawn_monitor/1` exists to report, and it is reachable in
+  # production: `clickhouse` 0.32.0 raises from inside a query for a response its
+  # error-type lookup does not recognise, and names an undefined
+  # `ClickHouse.NetworkError` struct for `DB::NetException` bodies. Neither raise
+  # is in `AshClickhouse.Connection`'s rescue list, so both escape the insert and
+  # kill the process performing it.
+  #
+  # Matching on `write_monitor` and not on `write_ref` is what makes this clause
+  # reachable at all. `spawn_monitor/1`'s ref and the `make_ref/0` used to
+  # correlate the result are *different* references — they agreed only because
+  # the monitor ref was discarded — so a real `:DOWN` never matched the write it
+  # belonged to, and the buffer waited forever for a message that was never coming.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{write_monitor: ref} = state) do
+    state =
+      state
+      |> tally({:error, crash_reason(reason), 0})
+      |> clear_write()
+      |> flush_now()
+
+    {:noreply, schedule_flush(reply_when_drained(state))}
   end
 
+  # Every other message. A `:DOWN` whose write already reported normally is one
+  # of these: the result message always precedes it from the same process, so
+  # `clear_write/1` has already run and there is nothing left to account.
   def handle_info(_message, state), do: {:noreply, state}
+
+  # A process killed by an uncaught error exits with `{error, stacktrace}` — but
+  # `error` is not always an exception struct. Elixir translates a raise into an
+  # `:erlang.error` and the process then dies with the Erlang reason, so
+  # `Map.update!/3` on a missing key gives `{{:badkey, key, map}, stacktrace}`
+  # rather than a `KeyError`. Both shapes have to read sensibly, and the
+  # stacktrace is noise in a message an operator reads.
+  defp crash_reason({error, stacktrace}) when is_list(stacktrace),
+    do: format_error(error)
+
+  defp crash_reason(reason), do: inspect(reason)
+
+  defp format_error(error) when is_exception(error), do: Exception.message(error)
+  defp format_error({:badkey, key}), do: "key #{inspect(key)} not found"
+  defp format_error({:badkey, key, _map}), do: "key #{inspect(key)} not found"
+  defp format_error(error), do: inspect(error)
 
   @impl GenServer
   def terminate(_reason, state) do
-    # One last attempt at whatever is buffered. Bounded, because
-    # `GenServer.stop/3` waits for this and its default timeout is `:infinity`:
-    # an unbounded write here means shutdown hangs behind an unresponsive
-    # ClickHouse for as long as the insert takes.
+    # One last attempt at whatever is buffered, and it must not be a *second*
+    # write. Bounded, because `GenServer.stop/3` waits for this and its default
+    # timeout is `:infinity`: an unbounded write here means shutdown hangs behind
+    # an unresponsive ClickHouse for as long as the insert takes.
     #
     # A `:brutal_kill` skips this, which is the one acceptable way to lose rows.
-    case pending_rows(state) do
-      [] -> :ok
-      rows -> bounded_flush(rows)
+    #
+    # A write already under way owns whatever happens next. `terminate/2` cannot
+    # learn its outcome — the process is about to stop, so nothing will ever
+    # `tally/2` it — and starting a second insert alongside it would break the one
+    # invariant that makes the ordering guarantee mean anything: at most one write
+    # outstanding, including at shutdown. So the queued rows wait for the
+    # outstanding write and are written by nothing if it does not finish. They are
+    # lost, and `Handler.uninstall/1`'s own flush has already accounted for what it
+    # could before reaching here.
+    case state.write_ref do
+      nil -> bounded_flush(pending_rows(state))
+      ref -> await_write(ref)
     end
 
     :ok
   end
 
+  # Waits for a write this process started and will never hear the result of. The
+  # receive is ref-matched: a bare two-element pattern would be satisfied by an
+  # unrelated message in the mailbox — a concurrent `{:enqueue, row}` cast among
+  # them — and return while the write was still running.
+  defp await_write(ref) do
+    receive do
+      {^ref, _result} -> :ok
+    after
+      @shutdown_flush_timeout -> :ok
+    end
+  end
+
   # `bulk_create/1` swallows its own failures, so the result is not interesting —
   # only whether it came back before the budget ran out. Rows written after the
-  # budget expires are lost, which `Handler.uninstall/1`'s own flush has already
-  # counted by the time it gets here.
+  # budget expires are lost.
+  defp bounded_flush([]), do: :ok
+
   defp bounded_flush(rows) do
     parent = self()
     ref = make_ref()
@@ -237,7 +325,7 @@ defmodule ClickhouseExLogger.Buffer do
     spawn_monitor(fn -> send(parent, {ref, bulk_create(rows)}) end)
 
     receive do
-      {_ref, _result} -> :ok
+      {^ref, _result} -> :ok
     after
       @shutdown_flush_timeout -> :ok
     end
@@ -270,12 +358,22 @@ defmodule ClickhouseExLogger.Buffer do
         parent = self()
         ref = make_ref()
 
-        {_pid, _monitor_ref} =
-          spawn_monitor(fn -> send(parent, {ref, bulk_create(rows)}) end)
+        {_pid, monitor} = spawn_monitor(fn -> send(parent, {ref, bulk_create(rows)}) end)
 
-        %{state | rows: :queue.new(), write_ref: ref, in_flight: length(rows)}
+        %{
+          state
+          | rows: :queue.new(),
+            write_ref: ref,
+            write_monitor: monitor,
+            in_flight: length(rows)
+        }
     end
   end
+
+  # `tally/2` reads `in_flight`, so every path that ends a write clears the
+  # bookkeeping only after it has accounted for the rows.
+  defp clear_write(state),
+    do: Map.merge(state, %{write_ref: nil, write_monitor: nil, in_flight: 0})
 
   defp pending_rows(state), do: state.rows |> :queue.to_list()
 
@@ -300,6 +398,19 @@ defmodule ClickhouseExLogger.Buffer do
         lost: state.lost + lost(state, committed),
         failed: state.failed + 1
     }
+  end
+
+  # Any result shape the writer was not contracted to produce. Counted as a failed
+  # flush with nothing committed, so the batch lands in `lost` and the buffer keeps
+  # running.
+  #
+  # `Insert.insert/1`'s corrected contract makes this unreachable, which is the
+  # point of correcting it. The alternative is not unreachable at all: a clause
+  # that does not match raises inside the only process that writes logs, and a
+  # crash there discards everything buffered behind it without counting a row. The
+  # buffer's job is to survive the writer, not to audit it.
+  defp tally(state, unexpected) do
+    tally(state, {:error, "unexpected insert result: #{inspect(unexpected)}", 0})
   end
 
   # One flush is several inserts, and the ones before a failure are already
@@ -365,4 +476,10 @@ defmodule ClickhouseExLogger.Buffer do
       active?: false
     }
   end
+
+  # The buffer is running but did not answer within the call's timeout. The
+  # counters are unknown rather than zero, and there is no value for "unknown" in
+  # this map, so they read zero. `active?: true` is the load-bearing part: it is
+  # what separates "delivering, ask again" from "never started".
+  defp unanswered_stats, do: %{empty_stats() | active?: true}
 end

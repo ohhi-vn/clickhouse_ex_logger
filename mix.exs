@@ -4,7 +4,7 @@ defmodule ClickhouseExLogger.MixProject do
   # Named once, so `version:`, `source_url:`, `homepage_url:`, `:links`, and the
   # ExDoc `source_ref` cannot drift apart. Hex requires a semantic version; while
   # the major version is `0`, a breaking change increments the minor version.
-  @version "0.1.0"
+  @version "0.2.0"
 
   # The project's one canonical URL. It is the only host this project verifiably
   # has, being the configured `origin`, so `homepage_url` is the repository rather
@@ -138,10 +138,17 @@ defmodule ClickhouseExLogger.MixProject do
   # The two directories are exhaustive on purpose, so that adding a runtime asset
   # does not also require adding a manifest entry.
   #
+  # `config` is deliberately *not* shipped, even though this project keeps
+  # `config/config.exs` in the checkout. Mix evaluates only the *current* project's
+  # configuration — `mix loadconfig` reads `Mix.Project.config()[:config_path]` — so a
+  # dependency's `config/` is never read by a host. Shipping it would add files to
+  # the package that cannot affect anything, and the host still needs to name the
+  # domain in its own config. The README says so where a host configures the repo.
+  #
   # `priv` is load-bearing, not padding. `ClickhouseExLogger.Migration` resolves its
-  # migrations through `:code.priv_dir/1`, because `AshClickhouse.MigrationRunner`
-  # would otherwise resolve its default relative path against the *caller's*
-  # working directory. Omitting `priv` ships a
+  # migrations through `:code.priv_dir/1`, because
+  # `AshClickhouse.MigrationRunner` would otherwise resolve its default relative
+  # path against the *caller's* working directory. Omitting `priv` ships a
   # `mix clickhouse_ex_logger.migrate` task that fails on `:code.priv_dir/1`
   # returning `{:error, :bad_name}` — the task every host runs before it can log
   # anything. `test/mix_project_test.exs` fails if a migration goes missing.

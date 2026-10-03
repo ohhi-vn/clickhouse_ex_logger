@@ -65,7 +65,10 @@ defmodule ClickhouseExLogger.TestServer do
   """
   @spec system_query!(String.t()) :: String.t()
   def system_query!(sql) do
-    case ClickhouseExLogger.Repo.query(sql, [], database: "system", default_format: "TabSeparated") do
+    case ClickhouseExLogger.Repo.query(sql, [],
+           database: "system",
+           default_format: "TabSeparated"
+         ) do
       {:ok, result} -> result.raw
       {:error, reason} -> raise "ClickHouse query failed: #{inspect(reason)}\nSQL: #{sql}"
     end

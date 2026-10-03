@@ -258,6 +258,110 @@ defmodule ClickhouseExLogger.EventTest do
     end
   end
 
+  describe "both event shapes" do
+    # Depending on the OTP version, `:logger` carries an event's metadata nested
+    # under `:meta` or spread across the top level. The moduledoc promises both are
+    # handled, so a row must not depend on which shape produced the event.
+
+    defp flat_event(overrides \\ %{}) do
+      Map.merge(
+        %{
+          time: @usec,
+          level: :error,
+          msg: {:string, "boom"},
+          mfa: {MyApp.Worker, :run, 2},
+          file: "lib/my_app/worker.ex",
+          line: 42,
+          user_id: 7,
+          request_id: "abc"
+        },
+        overrides
+      )
+    end
+
+    test "reads metadata carried at the top level" do
+      row = Event.row(flat_event())
+
+      assert row.metadata == %{"user_id" => "7", "request_id" => "abc"}
+    end
+
+    test "produces the same row for the same content in either shape" do
+      nested =
+        event(%{
+          level: :error,
+          msg: {:string, "boom"},
+          meta: %{user_id: 7, request_id: "abc"}
+        })
+
+      # `id` is generated per row, so it is the one field that cannot match.
+      assert Map.delete(Event.row(nested), :id) == Map.delete(Event.row(flat_event()), :id)
+    end
+
+    test "lets nested metadata win when both shapes carry a key" do
+      row =
+        Event.row(flat_event(%{request_id: "from-the-top", meta: %{request_id: "nested"}}))
+
+      assert row.metadata == %{"user_id" => "7", "request_id" => "nested"}
+    end
+
+    test "recognises the internal marker carried at the top level" do
+      # The marker is what stops a ClickHouse outage feeding itself. Missing it on
+      # one shape would let the library's own failure report become a row.
+      assert Event.internal?(flat_event(%{clickhouse_ex_logger_internal: true}))
+    end
+
+    test "recognises the internal marker carried under meta" do
+      assert Event.internal?(event(%{meta: %{clickhouse_ex_logger_internal: true}}))
+    end
+
+    test "is not internal without the marker" do
+      refute Event.internal?(flat_event())
+      refute Event.internal?(event())
+    end
+  end
+
+  describe "source-location values that cannot be rendered" do
+    # `row/2` promises never to raise, and the message path already renders rather
+    # than raises. The `:file` path did not, for the same shapes of input.
+
+    test "renders a code point that is not a valid character rather than raising" do
+      # A surrogate half. Range-checking it accepts, `List.to_string/1` rejects.
+      row = Event.row(event(%{file: [0xD800, 0x41]}))
+
+      assert is_binary(row.file)
+    end
+
+    test "renders a list that is not well-formed rather than raising" do
+      row = Event.row(event(%{file: [97 | 98]}))
+
+      assert is_binary(row.file)
+    end
+
+    test "renders an empty list as no characters, not as an inspected list" do
+      assert Event.row(event(%{file: []})).file == ""
+    end
+
+    test "still renders an ordinary charlist path" do
+      assert Event.row(event(%{file: ~c"lib/my_app/worker.ex"})).file == "lib/my_app/worker.ex"
+    end
+
+    test "records an absent module as no value, not as the string nil" do
+      # `WHERE module IS NULL` is the query for "no calling module". A row holding
+      # the four characters `nil` is invisible to it.
+      row = Event.row(event(%{mfa: {nil, :run, 2}}))
+
+      assert row.module == nil
+      assert row.function == "run/2"
+    end
+
+    test "records a nil module from the top-level fields as no value either" do
+      row = Event.row(event(%{mfa: nil, module: nil, function: nil}))
+
+      assert row.module == nil
+      assert row.function == nil
+    end
+  end
+
   describe "stringify/1" do
     test "passes binaries through unchanged" do
       assert Event.stringify("already text") == "already text"
@@ -365,5 +469,6 @@ defmodule ClickhouseExLogger.EventTest do
     end
   end
 
-  defp captured_event, do: ClickhouseExLogger.CaptureHandler.next!() |> ClickhouseExLogger.Event.row()
+  defp captured_event,
+    do: ClickhouseExLogger.CaptureHandler.next!() |> ClickhouseExLogger.Event.row()
 end

@@ -24,6 +24,7 @@ defmodule ClickhouseExLogger.MixProjectTest do
   # `{:error, :bad_name}` — so this is the one manifest omission that makes the
   # package unusable rather than merely incomplete.
   @priv_path "priv"
+  @config_path "config"
 
   test "every shipped migration is in the manifest" do
     migrations = Path.wildcard(Path.join(@priv_path, "repo/migrations/*.exs"))
@@ -53,6 +54,16 @@ defmodule ClickhouseExLogger.MixProjectTest do
     end
   end
 
+  test "the configuration is deliberately not shipped" do
+    # Mix evaluates only the *current* project's configuration — `mix loadconfig`
+    # reads `Mix.Project.config()[:config_path]` — so a dependency's `config/` is
+    # never read by a host. Shipping `config/config.exs` would put files in the
+    # package that cannot affect anything, and would not give a host the
+    # `ash_domains` entry it needs. The README documents that entry instead.
+    refute Enum.any?(@files, &String.starts_with?(&1, @config_path)),
+           "config/ is in :files, but Mix never loads a dependency's config"
+  end
+
   test "the manifest ships no harness or build output" do
     for path <- @files do
       refute String.starts_with?(path, "test/"),
@@ -68,6 +79,41 @@ defmodule ClickhouseExLogger.MixProjectTest do
              "#{path} is an AppleDouble sidecar this volume wrote beside a real " <>
                "file. It is untracked (see .gitignore) and would ship as junk."
     end
+  end
+
+  test "the formatter is configured with a non-empty input list" do
+    # `.formatter.exs` computes its `:inputs` rather than globbing, because this
+    # volume's AppleDouble sidecars would break the formatter. It used to compute
+    # them with `Path.wildcard/1` on the whole pattern list, which returns `[]` for a
+    # list rather than expanding it — silently, with no error. `mix format` then
+    # formatted nothing and `--check-formatted` passed on every run, which is how an
+    # unformatted `handler.ex` reached the repository.
+    {_value, opts} = Code.eval_file(".formatter.exs")
+    inputs = Keyword.fetch!(opts, :inputs)
+
+    assert is_list(inputs)
+
+    assert inputs != [],
+           ".formatter.exs computes an empty :inputs, so `mix format` " <>
+             "silently formats nothing and `mix format " <>
+             "--check-formatted` always passes"
+
+    for path <- [
+          "mix.exs",
+          ".formatter.exs",
+          "config/config.exs",
+          "lib/clickhouse_ex_logger/handler.ex",
+          "lib/clickhouse_ex_logger.ex",
+          "test/mix_project_test.exs"
+        ] do
+      assert path in inputs,
+             "#{path} is not in the formatter's :inputs, so " <>
+               "`mix format` never checks it"
+    end
+
+    refute Enum.any?(inputs, &(Path.basename(&1) =~ ~r/^\._/)),
+           "an AppleDouble sidecar is in :inputs, which makes `mix format` die with " <>
+             "UnicodeConversionError"
   end
 
   test "the package is named for the OTP application it builds" do

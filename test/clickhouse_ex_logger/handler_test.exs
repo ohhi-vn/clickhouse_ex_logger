@@ -83,7 +83,11 @@ defmodule ClickhouseExLogger.HandlerTest do
       # `:buffer` set nothing is ever routed to it, so it stays empty and the row
       # in `logs` can only have come through the configured pid.
       {:ok, host_buffer} =
-        GenServer.start_link(Buffer, %{batch_size: 1, flush_interval_ms: 60_000, max_buffer_size: 10})
+        GenServer.start_link(Buffer, %{
+          batch_size: 1,
+          flush_interval_ms: 60_000,
+          max_buffer_size: 10
+        })
 
       on_exit(fn -> if Process.alive?(host_buffer), do: Buffer.stop(host_buffer) end)
 
@@ -107,19 +111,53 @@ defmodule ClickhouseExLogger.HandlerTest do
       assert message =~ "batch_size must be a positive integer"
     end
 
-    test "starts a buffer from a valid config" do
-      assert Handler.ensure_buffer_started(%{batch_size: 1, flush_interval_ms: 60_000}) == :ok
+    test "starts a buffer from a valid config, reporting that it did" do
+      assert {:ok, true} =
+               Handler.ensure_buffer_started(%{batch_size: 1, flush_interval_ms: 60_000})
+
       assert is_pid(GenServer.whereis(Buffer))
     end
 
-    test "leaves a running buffer alone" do
+    test "leaves a running buffer alone and reports that it did not start it" do
       {:ok, buffer} =
         Buffer.start_link(%{batch_size: 1, flush_interval_ms: 60_000, max_buffer_size: 10})
 
       # Different sizes, and the running buffer keeps its own: reconfiguring a
       # buffer that already holds rows would strand them.
-      assert Handler.ensure_buffer_started(%{batch_size: 99}) == :ok
+      assert {:ok, false} = Handler.ensure_buffer_started(%{batch_size: 99})
       assert GenServer.whereis(Buffer) == buffer
+    end
+  end
+
+  describe "a rejected install" do
+    test "leaves nothing running", %{handler_id: handler_id} do
+      refute GenServer.whereis(Buffer)
+
+      assert {:error, {:level, message}} = Handler.install(handler_id, %{level: :not_a_level})
+      assert message =~ ":level must be one of"
+
+      # The buffer is `start_link`ed to the caller, so leaving it behind would leak a
+      # process that no handler is attached to.
+      refute GenServer.whereis(Buffer)
+    end
+
+    test "leaves a buffer it did not start alone", %{handler_id: handler_id} do
+      {:ok, buffer} =
+        Buffer.start_link(%{batch_size: 1, flush_interval_ms: 60_000, max_buffer_size: 10})
+
+      assert {:error, {:level, _message}} = Handler.install(handler_id, %{level: :not_a_level})
+
+      assert Process.alive?(buffer)
+      assert GenServer.whereis(Buffer) == buffer
+    end
+
+    test "can be retried once the config is fixed", %{handler_id: handler_id} do
+      # The point of rolling back is that the next attempt starts clean — an
+      # `{:error, {:already_started, pid}}` left over from the failed attempt would
+      # make the retry impossible.
+      assert {:error, {:level, _message}} = Handler.install(handler_id, %{level: :not_a_level})
+      assert {:ok, ^handler_id} = Handler.install(handler_id, %{batch_size: 2})
+      assert is_pid(GenServer.whereis(Buffer))
     end
   end
 
@@ -185,6 +223,52 @@ defmodule ClickhouseExLogger.HandlerTest do
       refute match?({:ok, _}, :logger.get_handler_config(handler_id))
     end
 
+    test "rejects a level that is not an atom, naming the option" do
+      for value <- ["warning", 1, nil, [:warning]] do
+        assert {:error, {:level, message}} = Handler.validate(%{level: value})
+        assert message =~ ":level must be one of"
+      end
+    end
+
+    test "accepts every severity level :logger understands" do
+      for level <- [:all, :debug, :info, :notice, :warning, :error, :critical, :alert, :emergency] do
+        assert {:ok, _options} = Handler.validate(%{level: level})
+      end
+    end
+
+    test "rejects a batch size above the maximum buffer size, naming the option" do
+      # With the batch trigger above the cap, the buffer is held below the batch
+      # size, the trigger can never fire, and rows are discarded for a reason that
+      # has nothing to do with ClickHouse.
+      assert {:error, {:batch_size, message}} =
+               Handler.validate(%{batch_size: 100, max_buffer_size: 3})
+
+      assert message =~ ":batch_size (100)"
+      assert message =~ ":max_buffer_size (3)"
+    end
+
+    test "accepts a batch size equal to the maximum buffer size" do
+      # Equal is a host asking for the smallest batch the buffer can write, and the
+      # trigger still fires.
+      assert {:ok, %{batch_size: 3, max_buffer_size: 3}} =
+               Handler.validate(%{batch_size: 3, max_buffer_size: 3})
+    end
+
+    test "rejects a batch size above the maximum buffer size at registration too", %{
+      handler_id: handler_id
+    } do
+      assert {:error, {:batch_size, _message}} =
+               Handler.install(handler_id, %{batch_size: 100, max_buffer_size: 3})
+
+      refute GenServer.whereis(Buffer)
+      refute match?({:ok, _}, :logger.get_handler_config(handler_id))
+    end
+
+    test "the defaults satisfy the relationship the validation requires" do
+      assert {:ok, %{batch_size: batch, max_buffer_size: max}} = Handler.validate(%{})
+      assert batch <= max
+    end
+
     test "accepts include_node as a boolean, by default and explicitly" do
       assert :ok = Handler.validate_include_node(%{})
       assert :ok = Handler.validate_include_node(%{include_node: true})
@@ -213,6 +297,7 @@ defmodule ClickhouseExLogger.HandlerTest do
       # must not widen `Buffer.options()`.
       assert {:ok, options} = Handler.validate(%{include_node: false})
       refute Map.has_key?(options, :include_node)
+
       assert Map.keys(options) |> Enum.sort() == [
                :batch_size,
                :flush_interval_ms,
@@ -315,9 +400,12 @@ defmodule ClickhouseExLogger.HandlerTest do
 
   describe "uninstall/1" do
     test "drains buffered rows so accepted logs are not discarded", %{handler_id: handler_id} do
+      # A batch size at the cap, not above it: the point is to hold rows back until
+      # removal, and a trigger above the cap could never fire even if the buffer
+      # were allowed to grow that far — `validate/1` rejects that combination.
       {:ok, _} =
         Handler.install(handler_id, %{
-          batch_size: 10_000,
+          batch_size: 100,
           flush_interval_ms: 60_000,
           max_buffer_size: 100
         })

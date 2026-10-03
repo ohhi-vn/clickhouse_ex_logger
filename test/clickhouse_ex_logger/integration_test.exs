@@ -205,9 +205,12 @@ defmodule ClickhouseExLogger.IntegrationTest do
   end
 
   test "removing the handler drains what was already accepted", %{handler_id: handler_id} do
+    # A batch size at the cap, not above it: these rows are held back until
+    # removal on purpose, and a trigger above the cap could never fire even if
+    # the buffer were allowed to grow that far — `validate/1` rejects it.
     {:ok, _} =
       Handler.install(handler_id, %{
-        batch_size: 10_000,
+        batch_size: 100,
         flush_interval_ms: 60_000,
         max_buffer_size: 100
       })
