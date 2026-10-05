@@ -354,7 +354,6 @@ the caller.
 - **THEN** the buffer size stays at or below the configured maximum, the
   process logging events is never blocked, and the count of discarded events is
   observable
-
 ### Requirement: Failure handling and observability
 
 A failed insert SHALL NOT raise into the application, SHALL NOT retry
@@ -575,6 +574,155 @@ failure SHALL be handled per the failure-handling requirement until it does.
 - **THEN** the writes are rejected by ClickHouse, the failure is reported and
   counted as lost per the failure-handling requirement, and the reported reason
   names the missing column
+### Requirement: Automatic startup of the log pipeline
+
+The system SHALL start its own pipeline when its application starts: it SHALL
+supervise the ClickHouse connection and attach the `:logger` handler. A host that
+has declared the dependency and configured the connection SHALL NOT have to write
+application code to begin shipping logs.
+
+The automatic start SHALL NOT be a second registration path. It SHALL go through
+the same registration operation an explicit host call uses, and SHALL take the
+same options and reject the same invalid ones, so that the guarantees that
+operation makes — validation before anything starts, all-or-nothing behaviour, and
+nothing left running after a rejected registration — hold for it identically.
+
+The options the automatic start uses SHALL be read from the application's
+configuration, so that a host states them in the same place it states its
+connection.
+
+The automatic start SHALL NOT create or alter any ClickHouse schema.
+
+Starting the pipeline SHALL be reversible within the documented bounds. When the
+host's application stops, the handler SHALL stop receiving events before the buffer
+drains, and the drain SHALL remain bounded, with events that could not be delivered
+counted as lost.
+
+A host SHALL be able to disable the automatic start, and when it is disabled the
+system SHALL start nothing. The host SHALL be able to disable it because the
+connection cannot be established twice in one VM: a host that both supervises the
+connection itself and leaves the automatic start enabled would fail to start, and
+the system SHALL NOT require a host to learn that by crashing. The documentation
+SHALL state this, naming both the situation it applies to and the setting that
+resolves it.
+
+Where the connection is not configured, the automatic start SHALL fail and the
+failure SHALL name the configuration the host is missing. It SHALL NOT fall back to
+a default destination.
+
+#### Scenario: Host declares the dependency and configures the connection
+
+- **WHEN** a host declares the dependency, configures the connection, and starts
+  its application
+- **THEN** the connection is supervised and the handler is attached, and the
+  host's own code contains no reference to either
+
+#### Scenario: Automatic start uses the host's configured options
+
+- **WHEN** the host configures a minimum level, batch size, flush interval, maximum
+  buffer size, or node-capture option, and its application starts
+- **THEN** the running pipeline uses those values, and an option the host omitted
+  takes its documented default
+
+#### Scenario: Configured option is invalid
+
+- **WHEN** the host configures an option the system cannot honour and its
+  application starts
+- **THEN** the start fails with an error identifying that option, and nothing the
+  start began is left running
+
+#### Scenario: Connection is not configured
+
+- **WHEN** a host declares the dependency without configuring the connection and
+  starts its application
+- **THEN** the start fails with an error naming the missing configuration, rather
+  than starting against a default destination
+
+#### Scenario: Host disables the automatic start
+
+- **WHEN** the host disables the automatic start and its application starts
+- **THEN** the system starts no connection and attaches no handler, so the host
+  can supervise the connection and attach the handler itself
+
+#### Scenario: Host registers explicitly while the automatic start is enabled
+
+- **WHEN** the automatic start has already attached the handler and the host
+  attaches it again through the explicit operation
+- **THEN** one handler and one buffer are running, not two
+
+#### Scenario: Application stops while events are buffered
+
+- **WHEN** the host's application stops with events still buffered
+- **THEN** the handler stops receiving events first, the buffer drains within the
+  documented bound, and the events it could not deliver are counted as lost
+### Requirement: Startup schema readiness
+
+Before attaching the handler automatically, the system SHALL determine once
+whether the table it writes to exists, and SHALL base its decision to attach on
+that result.
+
+Where the server answers and the table is absent, the system SHALL NOT attach the
+handler and SHALL report once through the standard logger that the table is
+missing, naming the operation that creates it. A host that has not created the
+schema SHALL therefore be given a readable message rather than a rising count of
+events silently lost.
+
+Where the server cannot be reached, the system SHALL attach the handler anyway and
+leave delivery to be handled as any other delivery failure. A server that is
+briefly unavailable at startup SHALL NOT leave the host without log capture until
+its next restart.
+
+The check SHALL confirm that the table exists, not that it carries every column the
+current library version writes. A table that exists but predates a column added by
+a later version SHALL still be attached, and the writes ClickHouse rejects SHALL be
+reported and counted per the failure-handling requirement, which is the outcome
+the upgrade guidance already describes.
+
+The check SHALL be read-only. It SHALL NOT create, alter, or migrate any schema,
+and it SHALL NOT be performed by the process that attaches the handler, so that
+attaching performs no network work.
+
+The check SHALL NOT hold up the host's start-up. It SHALL be performed on the
+system's own process, and the host's application SHALL reach its own start-up
+return whether or not the check has answered.
+
+#### Scenario: Table exists
+
+- **WHEN** the server answers at startup and the table exists
+- **THEN** the handler is attached and no statement that creates or alters schema
+  has been issued
+
+#### Scenario: Table does not exist
+
+- **WHEN** the server answers at startup and the table does not exist
+- **THEN** the handler is not attached, and one error naming the operation that
+  creates the table is reported
+
+#### Scenario: Server cannot be reached
+
+- **WHEN** the server cannot be reached at startup
+- **THEN** the handler is attached anyway, and delivery failures are reported and
+  counted as any other delivery failure
+
+#### Scenario: Table predates a column this version writes
+
+- **WHEN** the table exists at startup but does not carry a column the current
+  library version writes
+- **THEN** the handler is attached, and the writes ClickHouse rejects are reported
+  with the missing column named and counted as lost
+
+#### Scenario: Check does not hold up start-up
+
+- **WHEN** the host's application starts against a server that is slow to answer
+  or does not answer at all
+- **THEN** the host's own start-up returns without waiting for the check to
+  complete
+
+#### Scenario: Check changes no schema
+
+- **WHEN** the check runs at startup
+- **THEN** no database is created, no table is created or altered, and no migration
+  is recorded
 ### Requirement: Published library identity
 
 The library SHALL be published as the hex package `clickhouse_ex_logger`, built
@@ -607,12 +755,11 @@ configuration.
 #### Scenario: Host configures, starts, and migrates using the documented names
 
 - **WHEN** a host adds `{:clickhouse_ex_logger, "~> 0.1"}` to its dependencies,
-  configures `config :clickhouse_ex_logger, ClickhouseExLogger.Repo`, adds
-  `ClickhouseExLogger.Repo` to its supervision tree, runs
-  `mix clickhouse_ex_logger.migrate`, and calls
-  `ClickhouseExLogger.Handler.install/2`
+  configures `config :clickhouse_ex_logger, ClickhouseExLogger.Repo`, runs
+  `mix clickhouse_ex_logger.migrate`, and starts its application
 - **THEN** the `logs` table exists, subsequent log events reach it, and the
-  handler reports itself active
+  handler reports itself active, with no reference in the host's own code to the
+  connection or the handler
 
 #### Scenario: Host migrates from a release using only the documented names
 
@@ -641,7 +788,6 @@ configuration.
 - **WHEN** a host runs the migration command under the previous task name
 - **THEN** Mix reports that no such task exists, rather than running a migration
   under a name the library no longer supports
-
 ### Requirement: Published package contents
 
 The system SHALL publish a package whose contents are sufficient for a host to
@@ -657,12 +803,20 @@ to the same files from the library's own checkout and from a host's dependency t
 The package SHALL NOT include the library's own `config/` directory. The build
 system evaluates only the current project's configuration, so a dependency's
 `config/` is never read: shipping it would place files in the package that cannot
-affect a host, while still leaving the host to name this library's domain itself.
+affect a host.
 
-Where a host's build reports that this library's domain is not among the
-configured domains, the system SHALL document the configuration line that
-silences it, because the setting has to be stated in the host's own
-configuration and cannot be shipped from here.
+Because the package therefore carries no configuration, a host's build compiles
+this library's domain and resource without any domain registration. The system
+SHALL NOT report that as a warning in the host's build. It SHALL resolve this
+within its own definitions rather than by documenting a configuration line for
+the host, because the host has no domain to register: the domain and resource
+belong to this library, and a host that registered them would be reaching into a
+dependency's internals to silence a report about them.
+
+Suppressing that report SHALL NOT depend on the host disabling the check
+globally, and SHALL NOT be achieved by a setting only the host could make. It
+SHALL be scoped to this library's own domain and resource, so that a host's own
+Ash resources continue to be checked against the host's own configuration.
 
 A package manifest that omits the priv directory SHALL be treated as a defect rather
 than as a reduction in scope: the migration command is the only supported way for a
@@ -692,10 +846,15 @@ test build and are not part of the library a host consumes.
 
 #### Scenario: Host compiles against the shipped configuration
 
-- **WHEN** a host's build reports that this library's domain is not among the
-  configured domains
-- **THEN** the library's documentation states the configuration line that resolves
-  it, and the line is one the host adds to its own configuration
+- **WHEN** a host that has added no configuration for this library compiles
+- **THEN** its build reports no warning about this library's domain or resource,
+  because the host was never in a position to resolve the report
+
+#### Scenario: Host's own domain checking is unaffected
+
+- **WHEN** a host that keeps its own Ash resources compiles against this library
+- **THEN** this library's suppression does not extend to the host's own resources,
+  which continue to be checked against the host's own domain configuration
 
 #### Scenario: Manifest excludes the library's own configuration
 
@@ -720,8 +879,8 @@ test build and are not part of the library a host consumes.
 #### Scenario: Manifest excludes build-only and planning content
 
 - **WHEN** the package manifest is inspected
-- **THEN** it lists the library sources and its runtime assets, and does not list the
-  test-only support sources, coverage output, or the project's change records
+- **THEN** it lists the library sources and its runtime assets, and does not list
+  the test-only support sources, coverage output, or the project's change records
 ### Requirement: Published package metadata
 
 The package SHALL declare a description, a licence, and a set of links identifying
@@ -775,7 +934,6 @@ statement that the package contains credentials.
 - **WHEN** the package's metadata is inspected
 - **THEN** no path is excluded from credential scanning, because the package ships
   no credentials, test fixtures, or certificates that would need excluding
-
 ### Requirement: Published package documentation
 
 The library SHALL publish documentation to its documentation host alongside the
@@ -820,7 +978,6 @@ moment of release.
 - **THEN** the procedure includes building the package, listing the files it contains,
   and confirming the priv directory's migration files are among them, before the
   publishing step is run
-
 ### Requirement: Migration identity survives the rename
 
 The migration that creates the `logs` table SHALL be tracked in ClickHouse's
@@ -852,7 +1009,6 @@ against such a database.
 - **WHEN** the shipped migration is inspected after the rename
 - **THEN** its version string is unchanged from the version the library has
   always shipped, rather than a version derived from the rename
-
 ### Requirement: Node name capture is configurable
 
 The system SHALL record the node name on every row without requiring any
@@ -901,3 +1057,106 @@ this option existed.
 - **WHEN** an event carries user metadata with a key named `node`
 - **THEN** that key and value appear in the row's metadata map as user-supplied
   data, and do not affect the row's node field
+
+### Requirement: Bounded cost added to a logging call
+
+The system SHALL bound the processor time it adds to a logging call, measured from
+entry to the handler callback to its return. The bound SHALL be stated as a per-event
+budget and SHALL hold as an average over a run of at least ten thousand events, so
+that ordinary scheduling variation cannot account for the result either way.
+
+The budget SHALL cover only the work this system performs. It SHALL NOT be satisfied
+by work performed on the host's behalf by the logging system itself, or by any other
+handler the host has installed, because the host owns the cost of those and this
+system cannot reduce it.
+
+This bound is what makes the promise that a logging call never blocks meaningful. A
+call that does not wait on ClickHouse can still be arbitrarily expensive to make, and
+a host that finds logging too slow eventually turns it off — which loses the logs
+rather than slowing the application, and is a worse outcome than either.
+
+#### Scenario: A single logging call stays within the per-event budget
+
+- **WHEN** the process that logs an event is measured across a run of at least ten
+  thousand events carrying source location and metadata
+- **THEN** the average processor time the handler adds to each call is at or below
+  the stated per-event budget
+
+#### Scenario: The bound does not depend on how many events are logged
+
+- **WHEN** the same measurement is taken under a sustained rate rather than a single
+  event
+- **THEN** the average added cost per event remains at or below the same budget, so
+  the cost of shipping a log does not grow with volume
+
+#### Scenario: Cost is measured for this system's work only
+
+- **WHEN** the budget is evaluated
+- **THEN** the measurement spans the handler callback alone, and a host running
+  additional handlers or an expensive formatter is not charged for their cost against
+  this budget
+
+### Requirement: Work that depends only on the source location is not repeated per event
+
+The system SHALL NOT, for each accepted event, re-derive a value whose result is
+fully determined by the event's source location. A value that varies only across the
+set of distinct call sites in the running system SHALL be derived once per distinct
+value and reused for subsequent events reporting that value.
+
+Rendering the calling module and the calling function is the motivating case. In a
+running system the set of call sites that log is small and fixed, while the number of
+events they log is not, so deriving these per event repeats identical work once per
+logged line.
+
+The system SHALL reuse a derived value without changing what the row records: a row
+for an event that reuses a previously derived value SHALL be indistinguishable from
+one that derived it again, on every field the derivation feeds.
+
+#### Scenario: Repeated events from one call site record the same values
+
+- **WHEN** many events are logged from a single call site
+- **THEN** every resulting row records the same module and function values, exactly
+  as it would if each were derived independently
+
+#### Scenario: Distinct call sites are not conflated
+
+- **WHEN** events are logged from two different call sites, or from the same module
+  at different lines or arities
+- **THEN** each row records the values belonging to its own call site, and no value
+  derived for one call site is reported for another
+
+#### Scenario: Reuse does not outlive a change of value
+
+- **WHEN** a source location's derived value would differ from the previously derived
+  value for that location
+- **THEN** the new value is recorded, so reuse can never report a stale value
+
+### Requirement: A batch's field names are converted to wire form once per batch
+
+When the system encodes a batch for delivery, it SHALL convert the row field names to
+their wire form once for the batch rather than once per row. The field names of a
+batch are fixed by the table the rows target, so converting them per row repeats work
+whose result is identical for every row in the batch.
+
+The system SHALL continue to take the field names, their order, and the value
+encoding from the resource that defines the table, so that the wire format cannot
+drift from the table definition.
+
+#### Scenario: Field names are converted once for a batch
+
+- **WHEN** a batch of many rows is encoded for delivery
+- **THEN** each field name is converted to its wire form once for the batch rather
+  than once per row, so the cost of conversion does not grow with the number of rows
+
+#### Scenario: Wire format still derives from the table definition
+
+- **WHEN** the table's resource changes a field's name, order or encoding
+- **THEN** rows are encoded according to the changed definition, because the wire form
+  is read from the resource rather than restated independently of it
+
+#### Scenario: Every row still carries every column
+
+- **WHEN** a batch is encoded
+- **THEN** each row carries a value for every column the table defines, in the order
+  the table defines them, and a row missing a value is still encoded rather than
+  dropped

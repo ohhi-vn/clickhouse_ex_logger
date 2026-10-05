@@ -177,6 +177,91 @@ defmodule ClickhouseExLogger.EventTest do
     end
   end
 
+  # The source-location strings are cached per call site, so these guard the two
+  # ways that cache could report the wrong thing: a value belonging to one call
+  # site appearing on another's row, and a repeat of the same call site drifting.
+  describe "source location reuse" do
+    test "repeated events from one call site record identical values" do
+      rows = for _ <- 1..25, do: Event.row(event())
+
+      assert Enum.uniq(Enum.map(rows, & &1.module)) == [inspect(MyApp.Worker)]
+      assert Enum.uniq(Enum.map(rows, & &1.function)) == ["run/2"]
+    end
+
+    test "two functions in one module each record their own" do
+      # This is the case a cache keyed on the module alone gets wrong: both mfas
+      # share a module, so a module-keyed entry would hand the second one the
+      # first one's `function`.
+      run = Event.row(event(%{mfa: {MyApp.Worker, :run, 2}}))
+      stop = Event.row(event(%{mfa: {MyApp.Worker, :stop, 0}}))
+
+      assert run.function == "run/2"
+      assert stop.function == "stop/0"
+      assert run.module == stop.module
+    end
+
+    test "the same function at two arities records its own arity" do
+      two = Event.row(event(%{mfa: {MyApp.Worker, :run, 2}}))
+      one = Event.row(event(%{mfa: {MyApp.Worker, :run, 1}}))
+
+      assert two.function == "run/2"
+      assert one.function == "run/1"
+    end
+
+    test "an interleaved second call site does not disturb the first" do
+      # Warm the first call site's entry, then read the second, then the first
+      # again — the shape a warm cache actually sees in a running system.
+      first = Event.row(event(%{mfa: {MyApp.Worker, :run, 2}}))
+      _other = Event.row(event(%{mfa: {MyApp.Other, :go, 1}}))
+      again = Event.row(event(%{mfa: {MyApp.Worker, :run, 2}}))
+
+      assert again.module == first.module
+      assert again.function == first.function
+    end
+
+    test "an arity the BEAM could not have is derived, not cached, and still correct" do
+      # Outside the cache's bound, so it takes the uncached path. Correct either
+      # way is the point: the bound is a memory guard, not a behaviour change.
+      huge = Event.row(event(%{mfa: {MyApp.Worker, :run, 1_000_000}}))
+
+      assert huge.module == inspect(MyApp.Worker)
+      assert huge.function == "run/1000000"
+    end
+
+    test "a caller-supplied mfa cannot grow the cache without bound" do
+      # `:mfa` is read from `:meta` first, and `:meta` is the caller's.
+      # `:persistent_term` never reclaims a key, so a key space driven by log
+      # content would be a leak. Varying the arity over values past the cache's
+      # bound must therefore leave nothing behind.
+      for arity <- 1..50 do
+        assert Event.row(event(%{mfa: {MyApp.Worker, :run, arity + 10_000}})).function ==
+                 "run/#{arity + 10_000}"
+
+        assert :persistent_term.get(cache_key(MyApp.Worker, :run, arity + 10_000), :absent) ==
+                 :absent
+      end
+    end
+
+    test "a well-formed caller-supplied mfa is cached and correct" do
+      # The same shape as a real one, so it *is* cached — which is the other half of
+      # the bound above: within it, the key space is bounded by atoms, which code fixes.
+      key = cache_key(MyApp.Worker, :cached_call, 3)
+      on_entry(fn -> :persistent_term.erase(key) end)
+
+      assert Event.row(event(%{mfa: {MyApp.Worker, :cached_call, 3}})).function == "cached_call/3"
+      assert :persistent_term.get(key, :absent) != :absent
+      assert Event.row(event(%{mfa: {MyApp.Worker, :cached_call, 3}})).function == "cached_call/3"
+    end
+
+    defp cache_key(module, function, arity),
+      do: {ClickhouseExLogger.Event, :source_location, module, function, arity}
+
+    # Removes a cache entry after the test so a re-run starts clean. Without this the
+    # positive test above would pass on a leftover entry and stop proving that
+    # `row/2` writes one.
+    defp on_entry(fun), do: ExUnit.Callbacks.on_exit(fun)
+  end
+
   describe "node name" do
     # This module runs as `:nonode@nohost`, so the "distributed" branch cannot be
     # exercised here — it is covered in `ClickhouseExLogger.IntegrationTest` and by
@@ -255,6 +340,52 @@ defmodule ClickhouseExLogger.EventTest do
       assert :file in Event.reserved_keys()
       assert :domain in Event.reserved_keys()
       assert :clickhouse_ex_logger_internal not in Event.reserved_keys()
+    end
+
+    # `metadata/1` reads the top level and a nested map with different rules about
+    # `:msg`, `:level` and `:meta`, and a rewrite that collapses the two walks into
+    # one is exactly where the difference between them gets lost. Each rule below
+    # pins one half of it.
+
+    test "excludes :msg and :level from the top-level read" do
+      assert Event.row(event()).metadata == %{}
+    end
+
+    test "keeps a nested :level and :msg as user data" do
+      # They sit outside `:meta` on every shape, so on a flat event they are the
+      # event's own message and severity. Under `:meta` they are the caller's.
+      row = Event.row(event(%{meta: %{level: "user-level", msg: "user-msg"}}))
+
+      assert row.metadata == %{"level" => "user-level", "msg" => "user-msg"}
+    end
+
+    test "excludes :meta from the top level and as a reserved key" do
+      assert Event.row(event(%{meta: :not_a_map})).metadata == %{}
+      assert Event.row(event(%{meta: %{meta: "nested"}})).metadata == %{}
+    end
+
+    test "ignores a :meta that is not a map" do
+      for not_a_map <- [:an_atom, "a string", [1, 2], 42, nil] do
+        assert Event.row(event(%{meta: not_a_map})).metadata == %{}
+      end
+    end
+
+    test "nested wins a key the top level also carries, without losing the others" do
+      row =
+        Event.row(
+          event(%{
+            user_id: 9,
+            only_on_top: "top",
+            meta: %{request_id: "nested", only_nested: "nested"}
+          })
+        )
+
+      assert row.metadata == %{
+               "only_on_top" => "top",
+               "only_nested" => "nested",
+               "request_id" => "nested",
+               "user_id" => "9"
+             }
     end
   end
 

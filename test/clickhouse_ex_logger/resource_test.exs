@@ -149,6 +149,129 @@ defmodule ClickhouseExLogger.ResourceTest do
     end
   end
 
+  describe "domain inclusion suppression" do
+    # `ClickhouseExLogger.Domain` and `ClickhouseExLogger.LogEntry` set Ash's
+    # `validate_*_inclusion?` options, because a host compiling this package has
+    # no `:ash_domains` entry to add and so cannot resolve the report Ash would
+    # otherwise print into its build.
+    #
+    # What these tests establish is that the option is scoped to *those two*
+    # modules. The global alternative — `config :ash, validate_domain_resource_inclusion?: false`
+    # — would silence the check for every resource and domain in the host's project
+    # too, which is a real loss of signal and not this library's call to make.
+    #
+    # Each pair compiles two probes differing only in the option, against a domain
+    # that declares no resources at all — so a probe resource is genuinely outside
+    # every known domain, which is the situation a host's own resource is in. They
+    # are compiled at runtime rather than in `test/support` because the report is
+    # emitted while the module compiles, and only a compile performed inside
+    # `capture_io` can be asserted on.
+
+    @empty_domain ClickhouseExLogger.EmptyDomainProbe
+    @reported ClickhouseExLogger.ReportedResourceProbe
+    @suppressed ClickhouseExLogger.SuppressedResourceProbe
+    @reported_domain ClickhouseExLogger.ReportedDomainProbe
+    @suppressed_domain ClickhouseExLogger.SuppressedDomainProbe
+
+    test "a resource outside every known domain is still reported" do
+      report = capture_resource_compile(@reported, validate: false)
+
+      assert report =~ "is not present in any known Ash.Domain module"
+      assert report =~ inspect(@reported)
+    end
+
+    test "the same resource with the option set is not reported" do
+      refute capture_resource_compile(@suppressed, validate: true) =~
+               "is not present in any known Ash.Domain module"
+    end
+
+    test "a domain outside the configured list is still reported" do
+      report = capture_domain_compile(@reported_domain, validate: false)
+
+      assert report =~ "is not present in"
+      assert report =~ inspect(@reported_domain)
+    end
+
+    test "the same domain with the option set is not reported" do
+      refute capture_domain_compile(@suppressed_domain, validate: true) =~ "is not present in"
+    end
+
+    # Compiles a resource shaped like `ClickhouseExLogger.LogEntry` and returns
+    # whatever that compile wrote to stderr.
+    defp capture_resource_compile(module, opts) do
+      options =
+        ["data_layer: AshClickhouse.DataLayer", "domain: #{inspect(@empty_domain)}"]
+        |> maybe_validate(opts[:validate])
+        |> Enum.join(",\n    ")
+
+      capture_compile("""
+      defmodule #{inspect(module)} do
+        use Ash.Resource,
+          #{options}
+
+        attributes do
+          uuid_primary_key(:id, public?: true, writable?: true)
+        end
+
+        actions do
+          create :create do
+            primary?(true)
+            accept([:id])
+          end
+        end
+      end
+      """)
+    end
+
+    defp capture_domain_compile(module, opts) do
+      options =
+        case opts[:validate] do
+          true -> "Ash.Domain, validate_config_inclusion?: false"
+          _ -> "Ash.Domain"
+        end
+
+      capture_compile("""
+      defmodule #{inspect(module)} do
+        use #{options}
+      end
+      """)
+    end
+
+    defp capture_compile(source) do
+      ensure_empty_domain()
+
+      ExUnit.CaptureIO.capture_io(:stderr, fn -> Code.compile_string(source) end)
+    end
+
+    # `Ash.Resource`'s check reads `Ash.Domain.Info.allow_unregistered?/1` and the
+    # resource list off the compiled domain, so the domain has to exist before the
+    # resource naming it is compiled. It declares nothing, so every probe resource
+    # is outside it.
+    #
+    # Its own inclusion report is expected and irrelevant to every assertion here,
+    # so it is captured and discarded. Left to the caller's capture it would land
+    # in whichever assertion happened to run first and make the result depend on
+    # test order.
+    defp ensure_empty_domain do
+      unless Code.ensure_loaded?(@empty_domain) do
+        ExUnit.CaptureIO.capture_io(:stderr, fn ->
+          Code.compile_string("""
+          defmodule #{inspect(@empty_domain)} do
+            use Ash.Domain
+          end
+          """)
+        end)
+      end
+
+      :ok
+    end
+
+    # Left off entirely rather than set to `true`, so the reported case is the one
+    # a host's own resource actually hits: the default.
+    defp maybe_validate(options, true), do: options ++ ["validate_domain_inclusion?: false"]
+    defp maybe_validate(options, _validate), do: options
+  end
+
   describe "generated DDL" do
     setup do
       %{cql: AshClickhouse.Migration.create_table_cql(ClickhouseExLogger.LogEntry)}

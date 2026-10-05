@@ -12,13 +12,25 @@ defmodule ClickhouseExLogger.Handler do
         password: "",
         database: "my_app"
 
-  Create the schema — **before** you attach the handler, so the first flush has
+  Create the schema — **before** you start your application, so the first flush has
   somewhere to go:
 
       mix clickhouse_ex_logger.migrate
 
-  Add `ClickhouseExLogger.Repo` to your supervision tree, then install the handler
-  once the repo is up:
+  That is the whole setup. `ClickhouseExLogger.Application` starts this pipeline
+  when your application starts; there is nothing to add to your supervision tree
+  and nothing to call. `install/2` below is what it calls.
+
+  The handler's options are read from your configuration, and the automatic start
+  rejects a bad one at boot with an error naming it:
+
+      config :clickhouse_ex_logger, handler: [level: :info, batch_size: 500]
+
+  ## Starting it yourself instead
+
+  Set `config :clickhouse_ex_logger, auto_start: false` and this library starts
+  nothing. Then do it in the order below — the repo first, so the first flush has
+  a live connection:
 
       def start(_type, _args) do
         children = [ClickhouseExLogger.Repo, ...]
@@ -29,8 +41,13 @@ defmodule ClickhouseExLogger.Handler do
         end
       end
 
-  Order matters: before the repo is up, early flushes fail and are counted, which
-  is safe but noisy.
+  Order matters there: before the repo is up, early flushes fail and are counted,
+  which is safe but noisy.
+
+  `install/2` is idempotent where it matters — an already-running buffer is reused
+  and an already-registered handler id is not registered twice — so calling it
+  while the automatic start is also enabled gives you one handler and one writer,
+  not two.
 
   ## Why not `config :my_app, :logger`
 
@@ -46,7 +63,7 @@ defmodule ClickhouseExLogger.Handler do
 
   Prefer `install/2`. Declarative registration hands the batching config straight
   to `:logger`, which neither validates it nor gives this library a hook to flush
-  on removal, so a typo in `:batch_size` surfaces as a misbehaving buffer rather
+  on removal — so a typo in `:batch_size` surfaces as a misbehaving buffer rather
   than an error at boot, and removing the handler discards whatever was buffered.
   `install/2` does both. See `uninstall/1`.
 

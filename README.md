@@ -20,6 +20,9 @@ end
 
 ## Setup
 
+Three steps. There is no application code to write: the library starts its own
+pipeline when your application starts.
+
 **1. Configure the connection.**
 
 ```elixir
@@ -41,25 +44,8 @@ Without the check it would fall back to `http://localhost:8123` and quietly
 write your logs somewhere you did not choose — or report every flush as failed,
 which looks like a ClickHouse outage rather than a configuration mistake.
 
-**If your build warns about the domain**, tell Ash where it is:
-
-```
-warning: Domain ClickhouseExLogger.Domain is not present in config :clickhouse_ex_logger, ash_domains: []
-```
-
-Name it in *your* configuration:
-
-```elixir
-config :clickhouse_ex_logger, ash_domains: [ClickhouseExLogger.Domain]
-```
-
-This is your line, not one this library can set for you. Mix evaluates only the
-current project's `config/`, so a dependency's own configuration is never read —
-which is why this library ships without its `config/` rather than relying on it to
-reach you.
-
-**2. Create the schema.** Run this from your application *before* you attach the
-handler, so the first flush has somewhere to go.
+**2. Create the schema.** Run this from your application *before* you start it, so
+the first flush has somewhere to go.
 
 ```sh
 mix clickhouse_ex_logger.migrate
@@ -97,26 +83,118 @@ new version starts logging.
 > resources by listing the modules of the *current* project, so it never sees
 > `ClickhouseExLogger.LogEntry` — that resource belongs to this dependency.
 
-**3. Add the repo to your supervision tree, then install the handler.** Order
-matters: before the repo is up, early flushes fail and are counted. That is safe
-but noisy.
+**3. Start logging.**
+
+That is the whole setup. Starting your application starts the ClickHouse
+connection and attaches the handler; there is nothing to add to your supervision
+tree and nothing to call.
+
+The library reads one thing at startup that is worth knowing about. It checks
+whether the `logs` table exists before it attaches:
+
+- **Table is there** — the handler attaches. This is the normal case.
+- **Server does not answer** — the handler attaches anyway, and delivery failures
+  are reported and counted like any other. A ClickHouse that is briefly down at
+  boot does not turn your logging off.
+- **Table is missing** — the handler does *not* attach, and you get one error
+  naming `mix clickhouse_ex_logger.migrate`. This is the "you forgot step 2" case,
+  and you get a sentence rather than a `lost` count that looks like an outage.
+  Create the table and restart.
+
+Read the check itself: it is one `SELECT count()` against `system.tables`. Nothing
+is created or altered at boot, ever — see
+[`ClickhouseExLogger.Migration`](https://hexdocs.pm/clickhouse_ex_logger/ClickhouseExLogger.Migration.html).
+
+### Upgrading from 0.2.x
+
+0.3.0 starts the pipeline itself. **If your application supervises
+`ClickhouseExLogger.Repo`, add this to your configuration before you upgrade:**
 
 ```elixir
-defmodule MyApp.Application do
-  use Application
+config :clickhouse_ex_logger, auto_start: false
+```
 
-  @impl true
-  def start(_type, _args) do
-    children = [
-      ClickhouseExLogger.Repo,
-      MyAppWeb
-      # ...
-    ]
+Without it your application will not boot:
 
-    with {:ok, pid} <- Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor) do
-      :ok = ClickhouseExLogger.Handler.install(:clickhouse_ex_logger, batch_size: 500)
-      {:ok, pid}
-    end
+```
+** (EXIT from #PID<0.123.0>) shutdown: failed to start child: ClickHouse.Interface.HTTP
+    ** (EXIT) an exception was raised:
+        ** (ArgumentError) errors were found at the given arguments:
+          * 1st argument: table name already exists
+```
+
+A ClickHouse client keeps a globally named ETS table per connection, so a second
+connection under the same name cannot be started — the client raises from inside
+the new process, and your supervisor takes the failure. This library starts the
+connection; your supervision tree would be starting the same one.
+
+With `auto_start: false` your existing code works unchanged: keep
+`ClickhouseExLogger.Repo` in your children and your
+`ClickhouseExLogger.Handler.install/2` call exactly as they are. Nothing else
+about 0.2.x's setup changed. If you had no application code, delete nothing —
+just upgrade.
+
+## Configuration
+
+All keys are optional except the connection block above.
+
+### The connection
+
+Set once, under `config :clickhouse_ex_logger, ClickhouseExLogger.Repo`. The
+supported keys are those of `AshClickhouse.Repo`: `:url`, `:username`,
+`:password`, `:database`, `:pool_size`, and `:ipv4_only`.
+
+### `:auto_start`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `:auto_start` | `true` | Whether the library starts the pipeline itself. See [Upgrading from 0.2.x](#upgrading-from-02x). |
+
+### `:handler`
+
+The options the automatically-started handler uses. Same options, same
+validation, same defaults as the table below:
+
+```elixir
+config :clickhouse_ex_logger, handler: [level: :info, batch_size: 500]
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `:level` | `:all` | Minimum level to ship. `:logger` filters on this. |
+| `:batch_size` | `500` | Buffered rows that trigger a write. |
+| `:flush_interval_ms` | `1_000` | How often to write a partial batch. |
+| `:max_buffer_size` | `10_000` | Hard cap on buffered rows. |
+| `:include_node` | `true` | Record the node name on each row. See [below](#node-tells-you-which-machine). |
+
+`:batch_size` is a **trigger, not a cap**: a write always takes everything
+buffered, so a slow write lets rows accumulate rather than leaving a remainder
+behind.
+
+A value that is not a positive integer fails the start with an error naming the
+option, rather than failing later during delivery. A non-boolean `:include_node`
+fails the same way.
+
+`:include_node` is a *handler* option rather than a batching one, so it does not
+appear in `Buffer.options()`.
+
+## Starting it yourself
+
+`Handler.install/2` and `Handler.uninstall/1` are still there, and still what the
+automatic start calls. Reach for them when you set `:auto_start` to `false` and
+want the same behaviour from your own code:
+
+```elixir
+def start(_type, _args) do
+  children = [
+    ClickhouseExLogger.Repo,
+    MyAppWeb
+    # ...
+  ]
+
+  with {:ok, pid} <- Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor) do
+    :ok = ClickhouseExLogger.Handler.install(:clickhouse_ex_logger, batch_size: 500)
+    {:ok, pid}
   end
 end
 ```
@@ -128,6 +206,11 @@ buffered, so call it from your shutdown path if you have one:
 ```elixir
 ClickhouseExLogger.Handler.uninstall(:clickhouse_ex_logger)
 ```
+
+`Handler.install/2` is idempotent where it matters: a running buffer is reused
+rather than duplicated, and an already-registered handler id is not registered
+twice. So calling it while the automatic start has already attached does not give
+you two handlers or two writers.
 
 ### Declarative registration
 
@@ -147,29 +230,6 @@ Prefer `Handler.install/2`. Declarative registration hands the config straight t
 `:logger`, which neither validates it nor gives this library a hook to flush on
 removal — so a typo in `:batch_size` shows up as a misbehaving buffer rather than
 an error at boot, and removing the handler discards whatever was buffered.
-
-## Configuration
-
-All keys are optional.
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `:level` | `:all` | Minimum level to ship. `:logger` filters on this. |
-| `:batch_size` | `500` | Buffered rows that trigger a write. |
-| `:flush_interval_ms` | `1_000` | How often to write a partial batch. |
-| `:max_buffer_size` | `10_000` | Hard cap on buffered rows. |
-| `:include_node` | `true` | Record the node name on each row. See [below](#node-tells-you-which-machine). |
-
-`:batch_size` is a **trigger, not a cap**: a write always takes everything
-buffered, so a slow write lets rows accumulate rather than leaving a remainder
-behind.
-
-A value that is not a positive integer fails `install/2` with an error naming the
-option, rather than failing later during delivery. A non-boolean `:include_node`
-fails the same way.
-
-`:include_node` is a *handler* option rather than a batching one, so it does not
-appear in `Buffer.options()`.
 
 ## The `logs` table
 

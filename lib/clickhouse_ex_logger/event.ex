@@ -78,6 +78,29 @@ defmodule ClickhouseExLogger.Event do
   module gives `module: nil`, not the four characters `nil`, so `WHERE module IS
   NULL` finds exactly those rows.
 
+  ## The source location is rendered once per call site, not once per event
+
+  `module` and `function` are strings derived from the event's `:mfa`, and deriving
+  them is not cheap: `inspect/1` on a module atom costs about 0.34 us and the
+  `function/arity` interpolation about 0.17 us, together roughly a fifth of the cost
+  of mapping an event at all. The set of call sites that log is small and fixed in a
+  running system while the number of events they log is not, so both values are
+  cached in `:persistent_term` and reused.
+
+  The cache is keyed on the whole `:mfa`, so two functions in one module are two
+  entries and neither can be reported for the other, and the derivation is a pure
+  function of that key — a value that would differ is a different key, so there is
+  no staleness to guard against.
+
+  Only a well-formed `:mfa` is cached, and the arity bound is what makes that safe
+  rather than merely cautious. `:mfa` is read from `:meta` before the top level and
+  `:meta` is whatever the caller logged, so its shape is caller-controlled.
+  `:persistent_term` never reclaims a key, so an unbounded key space would be an
+  unbounded leak driven by log content. Module and function are atoms, drawn from
+  the atom table and so bounded by code; arity is an arbitrary term, and requiring
+  it to be an arity the BEAM could have is what bounds the key space. Anything else
+  is derived directly and cached never.
+
   ## The node name does not come from the event
 
   The `node` column is read from `node/0` — the running system — not from the
@@ -126,6 +149,21 @@ defmodule ClickhouseExLogger.Event do
   # from its top-level read; they are not part of `@event_keys`, which is the list
   # that keeps Erlang's fields out of *nested* metadata.
   @flat_only_keys ~w(msg level)a
+
+  # `@event_keys` and `@flat_only_keys` as lookup maps rather than lists.
+  #
+  # `metadata/1` rejects Erlang's own fields from every event it reads, and a list
+  # membership test is linear in the list's length while a map lookup is not — so the
+  # lists stay the single statement of which keys are whose, and these are derived
+  # from them for the per-key test. Both are compile-time constants, so this costs
+  # nothing at runtime.
+  @reserved Map.new(@event_keys, &{&1, true})
+  @top_level_only Map.new([:meta | @flat_only_keys], &{&1, true})
+  @top_level_rejects Map.merge(@reserved, @top_level_only)
+
+  # The largest function arity the BEAM has, and so the largest one a real `:mfa`
+  # can carry. It bounds the source-location cache key: see `cached_source_location/1`.
+  @max_arity 255
 
   @doc """
   The metadata keys that are stored as their own columns.
@@ -304,12 +342,64 @@ defmodule ClickhouseExLogger.Event do
         # Through `string_or_nil/1`, whose atom clause excludes `nil`. A `:mfa` with
         # no module recorded the four characters `nil` here, and a query for rows
         # with no module — `WHERE module IS NULL` — could not find them.
-        {string_or_nil(module), format_mfa({module, function, arity})}
+        mfa = {module, function, arity}
+
+        if cacheable?(mfa) do
+          cached_source_location(mfa)
+        else
+          {string_or_nil(module), format_mfa(mfa)}
+        end
 
       _other ->
         # `Logger.bare_log/3` and translated OTP reports may carry `:module` and
         # `:function` without an `:mfa`. Prefer them, then give up.
         {string_or_nil(field(event, :module)), string_or_nil(field(event, :function))}
+    end
+  end
+
+  # Whether this `:mfa` may key the source-location cache.
+  #
+  # `:mfa` is read from `:meta` before the top level (`field/2`), and `:meta` is
+  # whatever the caller logged — so its shape is caller-controlled, not trusted.
+  # `:persistent_term` keeps every key it is given for the life of the VM and never
+  # reclaims one, so an unbounded key space is an unbounded leak driven by log
+  # *content*. An attacker or a buggy caller could otherwise grow the table forever
+  # with `Logger.info("x", mfa: {A, :b, <<1::1024>>})`.
+  #
+  # Module and function are atoms, so they are drawn from the atom table — bounded by
+  # code, and a caller inventing new ones hits the atom-table limit long before this
+  # cache matters. Arity is the unbounded component: it is an arbitrary term here,
+  # not a small integer. Requiring it to be an arity the BEAM could actually have
+  # keeps the key space to atoms times 256, and everything else falls through to
+  # being derived directly.
+  defp cacheable?({_module, _function, arity}) when is_integer(arity), do: arity in 0..@max_arity
+  defp cacheable?(_mfa), do: false
+
+  # The two strings a source location contributes, derived once per distinct
+  # location.
+  #
+  # `inspect/1` on a module atom costs about 0.34us and the `function/arity`
+  # interpolation about 0.17us — roughly a fifth of the cost of mapping an event at
+  # all, repeated once per logged line, to produce one of a handful of possible
+  # strings. `:persistent_term` is the right store for that: the hit rate is
+  # effectively total after warm-up, so there is no eviction policy to tune and no
+  # owning process, and reads need no lock.
+  #
+  # The key is the whole `:mfa`, not the module, so a cached value can never be
+  # reported for a different call site — two functions in one module are two keys.
+  # There is no staleness to guard against either: the derivation is a pure function
+  # of the key, so a value that would differ is already a different key.
+  defp cached_source_location({module, function, arity} = mfa) do
+    key = {__MODULE__, :source_location, module, function, arity}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        location = {string_or_nil(module), format_mfa(mfa)}
+        :persistent_term.put(key, location)
+        location
+
+      location ->
+        location
     end
   end
 
@@ -330,25 +420,42 @@ defmodule ClickhouseExLogger.Event do
   # outside `:meta` on every shape, so on a flat event they are the event's own
   # message and severity rather than user data. They are deliberately *not* added to
   # `@event_keys`: that list is what keeps Erlang's fields out of *nested*
-  # metadata, and a user key named `:level` under `:meta` is user data.
+  # metadata, and a user key named `:level` under `:meta` is user data. `:meta`
+  # itself is excluded from the top level for the same reason — it is the event's
+  # own structure, not something under it — and is *not* excluded from a nested map,
+  # where a user key named `:meta` is as much user data as one named `:level`.
   #
   # A `:meta` that is present but not a map is not a shape `:logger` produces, so
   # it is ignored rather than crashing the mapping.
+  #
+  # This reads each map once. It used to drop the reserved keys from the nested map,
+  # drop them from the top level, drop `:meta`/`:msg`/`:level` from that result,
+  # merge the two, and rebuild the whole thing — three walks and two intermediate
+  # maps where one walk each produces the answer, and `Map.drop/2` against a
+  # 21-element list is linear in that list's length on every key it visits.
+  #
+  # Order is the precedence: the top level goes in first so that the nested pass,
+  # running second, is what a key both shapes carry ends up holding.
   defp metadata(event) do
-    nested =
-      case Map.get(event, :meta) do
-        nested when is_map(nested) -> Map.drop(nested, @event_keys)
-        _other -> %{}
-      end
+    %{}
+    |> collect_metadata(event, @top_level_rejects)
+    |> collect_metadata(Map.get(event, :meta), @reserved)
+  end
 
-    top =
-      event
-      |> Map.drop(@event_keys)
-      |> Map.drop([:meta | @flat_only_keys])
+  defp collect_metadata(acc, map, rejects) when is_map(map) do
+    Enum.reduce(map, acc, fn {key, value}, acc -> put_user_metadata(acc, key, value, rejects) end)
+  end
 
-    top
-    |> Map.merge(nested, fn _key, _top, nested_value -> nested_value end)
-    |> Map.new(fn {key, value} -> {to_string(key), stringify(value)} end)
+  defp collect_metadata(acc, _not_a_map, _rejects), do: acc
+
+  defp put_user_metadata(acc, key, value, rejects) do
+    if Map.has_key?(rejects, key) do
+      acc
+    else
+      # `put`, not `update`: a later pass has to overwrite an earlier one for nested
+      # to win, and there is no old value to combine with.
+      Map.put(acc, to_string(key), stringify(value))
+    end
   end
 
   defp string_or_nil(value) when is_binary(value), do: value

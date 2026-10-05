@@ -4,7 +4,12 @@ defmodule ClickhouseExLogger.MixProject do
   # Named once, so `version:`, `source_url:`, `homepage_url:`, `:links`, and the
   # ExDoc `source_ref` cannot drift apart. Hex requires a semantic version; while
   # the major version is `0`, a breaking change increments the minor version.
-  @version "0.2.0"
+  #
+  # 0.3.0 is a breaking change for one host shape: a host that supervises
+  # `ClickhouseExLogger.Repo` itself now collides with this library starting the
+  # same connection, and must set `auto_start: false`. See the README's upgrade
+  # section.
+  @version "0.3.0"
 
   # The project's one canonical URL. It is the only host this project verifiably
   # has, being the configured `origin`, so `homepage_url` is the repository rather
@@ -166,9 +171,17 @@ defmodule ClickhouseExLogger.MixProject do
     |> Enum.sort()
   end
 
-  # Run "mix help compile.app" to learn about applications.
+  # `mod:` is what makes this library start itself. Without it a host has to add
+  # `ClickhouseExLogger.Repo` to its own supervision tree and call
+  # `ClickhouseExLogger.Handler.install/2` — two steps, in an order that matters,
+  # for work this library can do. See `ClickhouseExLogger.Application`.
+  #
+  # A dependency's `config/` is never read, so a host cannot switch this off by
+  # configuring us; the host's own `config :clickhouse_ex_logger, auto_start: false`
+  # is the switch, read at runtime from the host's application environment.
   def application do
     [
+      mod: {ClickhouseExLogger.Application, []},
       extra_applications: [:logger]
     ]
   end
@@ -176,7 +189,7 @@ defmodule ClickhouseExLogger.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:ash, "~> 3.33"},
+      {:ash, "~> 3.34"},
       {:ash_clickhouse, "~> 0.7"},
       {:clickhouse, "~> 0.32"},
       # Provisions the ClickHouse the suite runs against, so a developer needs a

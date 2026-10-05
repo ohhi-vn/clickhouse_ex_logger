@@ -51,15 +51,109 @@ defmodule ClickhouseExLogger.Migration do
   `ClickhouseExLogger.Repo` by then. `setup/1` therefore reuses a live repo
   connection when it finds one and starts a connection only when it does not.
 
-  ## Nothing here runs at application boot
+  ## Nothing here changes schema at application boot
 
-  A library must not create schema behind its host's back. This module is only
-  reachable from an explicit call — `mix clickhouse_ex_logger.migrate`,
-  `ClickhouseExLogger.Utils.migrate/1`, or test setup — never from starting the
-  `:clickhouse_ex_logger` application.
+  A library must not create schema behind its host's back. `setup/1` — the only
+  function here that writes DDL — is reachable only from an explicit call:
+  `mix clickhouse_ex_logger.migrate`, `ClickhouseExLogger.Utils.migrate/1`, or test
+  setup. Never from starting the `:clickhouse_ex_logger` application.
+
+  `logs_table_status/0` *is* reached at boot, by
+  `ClickhouseExLogger.HandlerInstaller`, and is deliberately read-only: one
+  `SELECT count()` against `system.tables`.
   """
 
   @bootstrap_name ClickhouseExLogger.Repo.CreateDatabase
+
+  # How long the readiness query may take. Bounded because the caller is a
+  # supervised child: a `GenServer` blocked in `handle_continue/2` does not run its
+  # `terminate/1`, so an unbounded query here would defer handler removal on
+  # shutdown for as long as the server took to answer.
+  #
+  # Generous enough for a `system.tables` count over a real network, small enough
+  # to stay well inside the buffer's own 5s shutdown budget. Exceeding it is not
+  # dangerous: the query fails, the failure reads as `:unreachable`, and an
+  # unreachable server attaches the handler anyway. The timeout fails in the safe
+  # direction.
+  @readiness_timeout 2_000
+
+  @doc """
+  Reports whether the `logs` table is there, changing nothing.
+
+  Returns `:present`, `:absent`, or `:unreachable`.
+
+  The three answers are not one question with two outcomes, because the caller
+  acts differently on each: a missing table means the host has not run the
+  migration, which is worth one readable message, while an unreachable server
+  means ClickHouse is briefly down, which is not a reason to stop capturing logs.
+  Collapsing them would either disable logging through an outage or say nothing
+  useful on a first install.
+
+  ## Why `system.tables` and not the configured database
+
+  A plain statement against the configured database cannot answer this when that
+  database does not exist — the server rejects it with `UNKNOWN_DATABASE`, which
+  is indistinguishable from the server being down. That is the case a first
+  install is in, and it is the case most worth catching.
+
+  The `database` query option is what resolves it: it is sent per request, so
+  asking for `system` overrides whatever the connection was bound to. A
+  connection bound to a database that does not exist can therefore still be asked
+  whether that database exists. Verified against the suite's container; see
+  `ClickhouseExLogger.HandlerInstaller`.
+
+  ## Read-only
+
+  One `SELECT count()`. It creates no database, no table, and records no
+  migration, which is what lets boot ask the question at all.
+  """
+  @spec logs_table_status() :: :present | :absent | :unreachable
+  def logs_table_status do
+    case ClickhouseExLogger.Repo.query(readiness_sql(), [], readiness_opts()) do
+      {:ok, result} ->
+        if String.trim(result.raw) == "0", do: :absent, else: :present
+
+      {:error, _reason} ->
+        :unreachable
+    end
+  end
+
+  @doc """
+  Reports whether `ClickhouseExLogger.LogEntry`'s table exists.
+
+  Read from the resource rather than repeated here, so the table this library
+  writes to and the table this library reports on cannot drift apart — the same
+  reason the `CREATE TABLE` statement is generated from the resource.
+  """
+  @spec logs_table() :: String.t()
+  def logs_table, do: AshClickhouse.DataLayer.Dsl.table(ClickhouseExLogger.LogEntry)
+
+  defp readiness_sql do
+    # Interpolated rather than bound: the `clickhouse` client's parameter binding
+    # is for INSERT row data, not for `SELECT` predicates. Both values are known
+    # to us — the table name comes from our own resource, the database from the
+    # host's config — and both are quoted as string literals, so a name carrying
+    # a quote cannot terminate the literal.
+    database = escape_literal(ClickhouseExLogger.Repo.database() || "default")
+
+    """
+    SELECT count() FROM system.tables \
+    WHERE database = '#{database}' AND name = '#{escape_literal(logs_table())}'
+    """
+  end
+
+  defp readiness_opts do
+    [
+      database: "system",
+      default_format: "TabSeparated",
+      connect_timeout: @readiness_timeout,
+      recv_timeout: @readiness_timeout
+    ]
+  end
+
+  defp escape_literal(value) do
+    value |> to_string() |> String.replace("\\", "\\\\") |> String.replace("'", "\\'")
+  end
 
   @doc """
   Ensures the configured database exists and applies pending migrations.

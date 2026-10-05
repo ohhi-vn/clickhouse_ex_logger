@@ -57,9 +57,15 @@ defmodule ClickhouseExLogger.LogEntry do
   read back with `Code.eval_string/1`.
   """
 
+  # `validate_domain_inclusion?: false` for the same reason as the domain's own
+  # `validate_config_inclusion?: false`: this resource belongs to this library, so
+  # a host cannot register the domain that would resolve the check, and a warning
+  # about it in the host's build is not something the host can act on. Scoped to
+  # this resource only.
   use Ash.Resource,
     data_layer: AshClickhouse.DataLayer,
-    domain: ClickhouseExLogger.Domain
+    domain: ClickhouseExLogger.Domain,
+    validate_domain_inclusion?: false
 
   import AshClickhouse.DataLayer.Dsl.Macros
 

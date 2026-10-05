@@ -115,17 +115,30 @@ defmodule ClickhouseExLogger.NoSchemaAtBootTest do
            "the shutdown flush created #{@absent_database}"
   end
 
-  test "the library has no boot code, so it cannot create schema", %{handler_id: handler_id} do
-    # The strongest structural guarantee available: the OTP application declares
-    # no `mod:`, so there is no `Application.start/2` for this library and
-    # nothing of ours runs when a host boots. Schema creation lives in
-    # `ClickhouseExLogger.Migration`, reachable only from the Mix task.
+  test "the startup readiness check creates no database", %{handler_id: handler_id} do
+    # The readiness check is the one piece of this library that now runs at boot,
+    # so it is the one piece that has to be shown not to write. It answers
+    # `:absent` here — the configured database does not exist — and asking the
+    # question must not be what brings it into being.
+    assert ClickhouseExLogger.Migration.logs_table_status() == :absent
+
+    refute database_exists?(@absent_database),
+           "the startup readiness check created #{@absent_database}"
+
+    _ = handler_id
+  end
+
+  test "the library has a boot callback now, and starting it writes no schema" do
+    # This library used to declare no `mod:` at all, so the strongest available
+    # argument was structural: there was no `Application.start/2`, therefore
+    # nothing of ours could run at a host's boot. It declares one now, so that
+    # argument is gone and the guarantee has to be observed instead — which is what
+    # the tests above do, for each thing boot now does: read the table's presence,
+    # install the handler, write a row, and flush.
     Mix.Task.rerun("app.config", ["--no-start"])
 
-    assert Application.spec(:clickhouse_ex_logger, :mod) in [nil, []]
-    refute Code.ensure_loaded?(ClickhouseExLogger.Application)
-
-    {:ok, _} = Handler.install(handler_id, %{batch_size: 2})
+    assert Application.spec(:clickhouse_ex_logger, :mod) ==
+             {ClickhouseExLogger.Application, []}
 
     refute database_exists?(@absent_database)
   end

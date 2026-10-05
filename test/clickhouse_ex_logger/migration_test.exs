@@ -90,6 +90,75 @@ defmodule ClickhouseExLogger.MigrationTest do
     end
   end
 
+  describe "logs_table_status/0" do
+    test "reports :present when the table is there" do
+      assert TestServer.table_exists?()
+      assert Migration.logs_table_status() == :present
+    end
+
+    test "reports :absent when the database does not exist" do
+      # The case a first install is in, and the one a plain statement cannot
+      # answer: a connection bound to a database that does not exist is rejected
+      # with `UNKNOWN_DATABASE`, which reads the same as the server being down.
+      # Asking for `system` per request overrides the binding, so the check can
+      # see that the database is missing rather than reporting it unreachable.
+      configure_database("clickhouse_ex_logger_readiness_absent")
+      restart_repo_connection()
+
+      assert database_absent?("clickhouse_ex_logger_readiness_absent")
+      assert Migration.logs_table_status() == :absent
+    end
+
+    test "reports :absent when the database exists but the table does not" do
+      assert Migration.logs_table_status() == :present
+
+      # The suite's shared table, so the restore is registered before the drop: a
+      # failure between the two would otherwise leave every later test failing for
+      # a reason that has nothing to do with what it is testing.
+      on_exit(&restore_logs_table/0)
+
+      TestServer.query!("DROP TABLE IF EXISTS #{TestServer.database()}.logs")
+      assert Migration.logs_table_status() == :absent
+    end
+
+    test "reports :unreachable when the server cannot be reached" do
+      configure_database("clickhouse_ex_logger_readiness_absent")
+      restart_repo_connection()
+
+      stop_repo_connection()
+
+      assert Migration.logs_table_status() == :unreachable
+    end
+
+    test "answers well inside the shutdown budget it is bounded by" do
+      # The caller is a supervised child, and a `GenServer` blocked in
+      # `handle_continue/2` does not run its `terminate/1`. So the query has to be
+      # bounded, and the bound has to leave room for the buffer's own 5s drain.
+      assert Migration.logs_table_status() == :present
+
+      {microseconds, answer} = :timer.tc(&Migration.logs_table_status/0)
+
+      assert answer == :present
+      assert microseconds < 1_000_000
+    end
+  end
+
+  defp database_absent?(database) do
+    TestServer.system_query!("SELECT count() FROM system.databases WHERE name = '#{database}'")
+    |> String.trim() == "0"
+  end
+
+  # From the resource's own DDL rather than through `setup/1`, which is idempotent
+  # by *version*: `schema_migrations` still records both migrations, so it would
+  # report the schema up to date and recreate nothing.
+  defp restore_logs_table do
+    if not TestServer.table_exists?() do
+      TestServer.query!(AshClickhouse.Migration.create_table_cql(ClickhouseExLogger.LogEntry))
+    end
+
+    :ok
+  end
+
   # Runs `setup/1` with no repo connection up, which is the state a host is in:
   # a second start in one VM raises on the client's named ETS table (see
   # `ClickhouseExLogger.Migration`'s moduledoc).
@@ -154,5 +223,17 @@ defmodule ClickhouseExLogger.MigrationTest do
     Process.unlink(conn)
 
     :ok
+  end
+
+  # The module-level `setup/0` restores the original config and connection on
+  # exit, so a test that repoints the repo only has to do the repointing.
+  defp configure_database(database) do
+    original = Application.fetch_env!(:clickhouse_ex_logger, ClickhouseExLogger.Repo)
+
+    Application.put_env(
+      :clickhouse_ex_logger,
+      ClickhouseExLogger.Repo,
+      Keyword.put(original, :database, database)
+    )
   end
 end

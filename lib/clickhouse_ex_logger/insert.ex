@@ -39,6 +39,19 @@ defmodule ClickhouseExLogger.Insert do
   `ClickhouseExLogger.LogEntry` via the data layer, so the wire format cannot
   drift from the resource definition.
 
+  ## Field names are converted once per flush, not once per row
+
+  `build_insert_rows/2` reads each row's values by *string* key, so rows reach it
+  with their field names already in wire form. Converting them is not free, and
+  every row in a flush has the same field names — so converting them per row
+  repeated, per row, work whose answer is identical for all of them. `insert/1`
+  reads them once per flush from the resource and reuses them.
+
+  Read from the resource rather than restated here: renaming or reordering an
+  attribute changes the wire form along with the table, which is the property that
+  keeps this module from drifting into a second, hand-maintained copy of the
+  schema.
+
   ## Partial success is reported, not hidden
 
   A flush is chunked at 1000 rows. When a chunk fails the ones before it are
@@ -53,6 +66,7 @@ defmodule ClickhouseExLogger.Insert do
   Isolating the call here is what makes that a one-place change.
   """
 
+  alias Ash.Resource.Info
   alias AshClickhouse.DataLayer
   alias AshClickhouse.DataLayer.Dsl
   alias AshClickhouse.DataLayer.Insert, as: DataLayerInsert
@@ -95,7 +109,7 @@ defmodule ClickhouseExLogger.Insert do
     # timestamps, below.
     {fields, encoded} =
       rows
-      |> Enum.map(&normalize/1)
+      |> Enum.map(&normalize(&1, row_field_names(resource)))
       |> DataLayerInsert.build_insert_rows(resource)
 
     statement =
@@ -122,17 +136,55 @@ defmodule ClickhouseExLogger.Insert do
     end
   end
 
+  # The table's field names as the row keys the encoder wants, keyed by the atom the
+  # row carries them under.
+  #
+  # Read from the resource rather than restated, so renaming or reordering an
+  # attribute changes the wire form with the table and cannot drift from it. Built
+  # once per flush rather than per row, because every row in a flush has the same
+  # field names — converting them per row repeated, per row, work whose answer is
+  # identical for all of them.
+  defp row_field_names(resource) do
+    for %{name: name} <- Info.attributes(resource), into: %{}, do: {name, to_string(name)}
+  end
+
   # Workaround 1 is the option-list leak; this covers it plus workaround 2 —
   # string keys, and the timestamp as an ISO-8601 UTC string, which ClickHouse
   # parses at full microsecond precision. Pre-encoding it here means
   # `build_insert_rows/2` sees a binary and passes it through untouched.
-  defp normalize(row) do
+  #
+  # `Map.update!("timestamp", ...)` still raises on a row with no timestamp, as it
+  # always has. The buffer treats a write that dies without reporting as a lost
+  # batch, so a row that could not be encoded is accounted rather than silently
+  # written as an empty column.
+  defp normalize(row, field_names) do
     row
-    |> Map.new(fn {key, value} -> {to_string(key), value} end)
+    |> string_keys(field_names)
     |> Map.update!("timestamp", fn
       %DateTime{} = datetime -> DateTime.to_iso8601(datetime)
       other -> other
     end)
+  end
+
+  # The row's own entries, keyed by wire name. Iterating the row rather than the
+  # resource's fields is deliberate: a key the row does not carry must stay absent
+  # rather than become an explicit `nil`, which the encoder would handle differently
+  # from a missing lookup.
+  defp string_keys(row, field_names) do
+    for {key, value} <- row, into: %{} do
+      {wire_name(field_names, key), value}
+    end
+  end
+
+  # A row key the table does not define cannot be precomputed, and falls back to
+  # converting it. `Map.fetch/2` rather than `Map.get/3`, whose default argument is
+  # evaluated eagerly and would convert every key on every row — the cost this
+  # change exists to remove.
+  defp wire_name(field_names, key) do
+    case Map.fetch(field_names, key) do
+      {:ok, name} -> name
+      :error -> to_string(key)
+    end
   end
 
   # `AshClickhouse.Connection.insert_rows/4` wraps only an exception it rescued. When

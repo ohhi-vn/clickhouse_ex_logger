@@ -10,15 +10,17 @@ defmodule ClickhouseExLogger.Repo do
         password: "",
         database: "my_app"
 
-  Add it to your supervision tree *before* you attach
-  `ClickhouseExLogger.Handler`, so the first flush has a live connection:
+  That is the whole setup. `ClickhouseExLogger.Application` supervises this repo
+  and `ClickhouseExLogger.HandlerInstaller` attaches the handler when your
+  application starts, so there is nothing to add to your supervision tree and
+  nothing to call.
 
-      children = [
-        ClickhouseExLogger.Repo,
-        # then, from your Application.start/2 callback:
-        # Logger.add_handlers(:my_app)
-        ...
-      ]
+  Set `config :clickhouse_ex_logger, auto_start: false` if you would rather
+  supervise it yourself — and then add `ClickhouseExLogger.Repo` to your children
+  and call `ClickhouseExLogger.Handler.install/2` once it is up. Do one or the
+  other, not both: a ClickHouse client keeps a globally named ETS table per
+  connection, so a second one cannot be started in the same VM and your supervisor
+  will fail with `ArgumentError: table name already exists`.
 
   The supported keys are those of `AshClickhouse.Repo`: `:url`, `:username`,
   `:password`, `:database`, `:pool_size`, and `:ipv4_only`. See

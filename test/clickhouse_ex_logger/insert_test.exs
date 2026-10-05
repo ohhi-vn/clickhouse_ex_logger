@@ -19,6 +19,7 @@ defmodule ClickhouseExLogger.InsertTest do
   use ClickhouseExLogger.Case
 
   alias ClickhouseExLogger.Insert
+  alias ClickhouseExLogger.LogEntry
   alias ClickhouseExLogger.TestServer
 
   setup do
@@ -160,6 +161,84 @@ defmodule ClickhouseExLogger.InsertTest do
       assert String.trim(message) != ""
       refute inspect_error_struct?(message)
     end
+  end
+
+  describe "insert/1 field names come from the resource" do
+    # `insert/1` converts each row's field names to wire form once per flush, from
+    # the resource's own attribute list. These pin the consequence: a wrong name in
+    # that list is not a cosmetic difference — the encoder looks the row up by
+    # string key, so a name it does not recognise leaves the column null. Writing a
+    # fully-populated row and reading every column back is what catches that.
+
+    test "every field's value lands in its own column" do
+      at = ~U[2026-01-02 03:04:05.000006Z]
+      id = Ash.UUID.generate()
+
+      assert {:ok, 1} =
+               Insert.insert([
+                 %{
+                   id: id,
+                   timestamp: at,
+                   level: :warning,
+                   message: "every-column",
+                   module: "MyApp.Worker",
+                   file: "/app/lib/my_app/worker.ex",
+                   line: 4242,
+                   function: "run/2",
+                   metadata: %{"user_id" => "7"},
+                   node: "my_app@10.0.0.5"
+                 }
+               ])
+
+      stored =
+        TestServer.query!(
+          "SELECT toString(id), toString(timestamp), level, message, module, file, " <>
+            "toString(line), function, metadata['user_id'], node FROM logs"
+        )
+        |> String.trim()
+        |> String.split("\t")
+
+      assert stored == [
+               to_string(id),
+               "2026-01-02 03:04:05.000006",
+               "warning",
+               "every-column",
+               "MyApp.Worker",
+               "/app/lib/my_app/worker.ex",
+               "4242",
+               "run/2",
+               "7",
+               "my_app@10.0.0.5"
+             ]
+    end
+
+    test "a field the resource does not define does not become a column" do
+      # If the column list were restated in `ClickhouseExLogger.Insert`, this key
+      # would either raise or grow a column. Driven by the resource, it is ignored.
+      assert {:ok, 1} = Insert.insert([Map.put(row("extra"), :not_a_column, "ignored")])
+
+      assert table_columns() == resource_columns()
+      refute "not_a_column" in table_columns()
+    end
+
+    test "the table's columns are the resource's, in the resource's order" do
+      assert table_columns() == resource_columns()
+    end
+  end
+
+  # The resource's attributes as wire-form names — compared as strings because
+  # `DESCRIBE TABLE` reports strings and comparing terms across the two would fail
+  # on their types rather than on the thing under test.
+  defp resource_columns do
+    LogEntry
+    |> Ash.Resource.Info.attributes()
+    |> Enum.map(&to_string(&1.name))
+  end
+
+  defp table_columns do
+    TestServer.query!("DESCRIBE TABLE logs")
+    |> String.split("\n", trim: true)
+    |> Enum.map(fn line -> line |> String.split("\t") |> hd() end)
   end
 
   defp stored_count, do: TestServer.query!("SELECT count() FROM logs") |> String.trim()

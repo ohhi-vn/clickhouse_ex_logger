@@ -12,6 +12,25 @@ config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
 
 config :logger, level: :info
 
+# The automatic start is off for the suite, and it has to be off *here* rather
+# than in `test/test_helper.exs`.
+#
+# Mix starts this application — `ClickhouseExLogger.Application` — before it loads
+# the test helper, and the automatic start would open a ClickHouse connection
+# using the configuration above: `http://localhost:8123`, which is not where
+# `ClickhouseExLogger.TestContainer` puts the server. `test_helper.exs` replaces
+# the repository configuration with the container's, but by then a connection
+# would already exist, and a second one cannot be started in the same VM
+# (`ClickHouse.Interface.HTTP` keeps a globally named ETS table per connection).
+#
+# Configuration is the only place early enough to prevent that, because Mix loads
+# it before it starts any application.
+#
+# The automatic start is not left untested for it —
+# `ClickhouseExLogger.ApplicationTest` starts the very same children under
+# `start_supervised!/1`.
+config :clickhouse_ex_logger, auto_start: false
+
 # `podman machine` forwards its API socket into a per-machine directory under the
 # system temp dir, which differs per machine and per macOS release.
 # `testcontainer_ex` scans a fixed list of socket paths and does not look there,

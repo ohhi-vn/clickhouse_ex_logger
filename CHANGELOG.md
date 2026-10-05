@@ -9,6 +9,22 @@ major version is `0`, a breaking change increments the minor version.
 
 ### Added
 
+- **The pipeline starts itself.** `ClickhouseExLogger.Application` is the OTP
+  application callback: it supervises `ClickhouseExLogger.Repo` and the buffer, and
+  `ClickhouseExLogger.HandlerInstaller` attaches the handler. A host that has
+  declared the dependency and configured the connection now writes no application
+  code to begin shipping logs — no supervision-tree entry, no `install/2` call.
+  Setup goes from five steps to three.
+- `config :clickhouse_ex_logger, handler: [...]` — the options the
+  automatically-started handler uses. The same options `Handler.install/2`
+  documents, validated the same way, rejected on the same terms.
+- `config :clickhouse_ex_logger, auto_start: false` — for a host that supervises
+  the connection itself. See the breaking change below for why this is required
+  rather than advisory in that case.
+- `ClickhouseExLogger.Migration.logs_table_status/0` — reports `:present`,
+  `:absent`, or `:unreachable` for the `logs` table with one read-only query.
+- `ClickhouseExLogger.HandlerInstaller.await_attach/1` — blocks until the automatic
+  start has decided whether to attach, and reports that decision.
 - `ClickhouseExLogger.Utils.migrate/1`, the migration entry point for a release:
   `bin/my_app eval "ClickhouseExLogger.Utils.migrate()"`. It applies the same
   migrations as `mix clickhouse_ex_logger.migrate` and reads the same connection
@@ -53,11 +69,71 @@ major version is `0`, a breaking change increments the minor version.
   `"nil"`, so `WHERE module IS NULL` finds those rows.
 - Both migration entry points now report a database name the server would reject as
   a failure naming that option, rather than raising out of `setup/1`.
-- The README now states the `ash_domains` configuration line that silences Ash's
-  domain-inclusion warning. It has to be set in the host's own configuration: Mix
-  evaluates only the current project's `config/`, so a dependency's is never read.
 
 ### Changed
+
+- **A logging call costs about 40% less.** This reduces the processor time this
+  library adds to each log call, **not** the rate at which rows reach ClickHouse — a
+  host whose problem is rows-per-second will not see the improvement it might expect
+  from the headline figure. Measured on the machine this was developed on, the
+  `:logger` handler callback went from ~3.72us to ~2.26us per event; mapping an event
+  on its own went from ~2.55us to ~1.50us. Three changes, none of which alters a row:
+
+  - `ClickhouseExLogger.Event` renders the calling module and `function/arity` once
+    per distinct call site rather than once per event, through a `:persistent_term`
+    cache keyed on the `:mfa`. `inspect/1` on a module atom cost about 0.34us and the
+    interpolation about 0.17us, repeated for every logged line to produce one of a
+    handful of possible strings. Only a well-formed `:mfa` is cached: `:mfa` is read
+    from `:meta`, which is caller-controlled, and `:persistent_term` never reclaims a
+    key, so the cache is bounded to arities the BEAM could actually have rather than
+    left open to log content.
+  - `ClickhouseExLogger.Event` reads an event's metadata in one pass per map instead
+    of dropping the reserved keys three times, merging, and rebuilding.
+  - `ClickhouseExLogger.Insert` converts a batch's field names once per flush, read
+    from `ClickhouseExLogger.LogEntry`, rather than once per row. Worth about 4% of a
+    flush (~54us per 500 rows) — the data layer's own per-row name conversions are the
+    larger remaining share and are deliberately left to it.
+
+  `ClickhouseExLogger.CostTest` now holds the caller path to a measured budget, and
+  `ClickhouseExLogger.WorkloadTest`'s per-call ceiling — previously 50ms, about four
+  orders of magnitude above the real cost and so incapable of failing — is 2s. That
+  ceiling is a maximum over 3200 calls under contention, where machine noise alone
+  reaches ~5ms; a blocked caller would show the client's 15s `recv_timeout`, which is
+  the failure it exists to catch.
+
+- **Breaking:** a host that supervises `ClickhouseExLogger.Repo` in its own
+  supervision tree must set `config :clickhouse_ex_logger, auto_start: false`
+  before upgrading, or its application will not boot:
+
+  ```
+  ** (EXIT from #PID<0.123.0>) shutdown: failed to start child: ClickHouse.Interface.HTTP
+      ** (EXIT) an exception was raised:
+          ** (ArgumentError) errors were found at the given arguments:
+            * 1st argument: table name already exists
+  ```
+
+  A ClickHouse client keeps a globally named ETS table per connection, so a second
+  connection under the same name cannot be started — the client raises from inside
+  the new process and the supervisor takes the failure. This library now starts
+  that connection, so a host that also starts it collides with itself. With
+  `auto_start: false` the existing setup works unchanged: keep the repo in your
+  children and your `Handler.install/2` call. A host with no application code has
+  nothing to change. Per this project's versioning note, a breaking change at
+  major `0` increments the minor version, so this release is `0.3.0`.
+- Before attaching, the automatic start checks once whether the `logs` table
+  exists. If the server answers and the table is absent, the handler is not
+  attached and one error names `mix clickhouse_ex_logger.migrate` — so a host that
+  has not created the schema gets a sentence rather than a `lost` count that is
+  indistinguishable from a ClickHouse outage. If the server cannot be reached the
+  handler attaches anyway, so a brief outage at boot does not turn log capture off
+  until the next restart. The check is read-only: boot still creates and alters no
+  schema, and it does not hold up the host's start-up.
+- The domain-inclusion warning Ash prints when a host compiles this package is gone.
+  `ClickhouseExLogger.Domain` and `ClickhouseExLogger.LogEntry` now resolve it in
+  their own definitions, so `config :clickhouse_ex_logger, ash_domains: [...]` is no
+  longer needed and should be removed. The suppression is scoped to those two
+  modules; a host's own resources are still checked against the host's own domain
+  configuration.
 
 - **Breaking:** `ClickhouseExLogger.Handler.ensure_buffer_started/1` now returns
   `{:ok, started?}` instead of `:ok`, where `started?` is `true` when *that call*
