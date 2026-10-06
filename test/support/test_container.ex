@@ -30,13 +30,14 @@ defmodule ClickhouseExLogger.TestContainer do
   The container's `default` user is left password-less, and `repo_config/0`
   says so explicitly.
 
-  That is not an oversight so much as a match for what the library can actually
-  do. `ClickhouseExLogger.Migration` builds its connections from
-  `AshClickhouse.Repo.config_to_conn_opts/1`, and that function does not carry
-  `:username` or `:password` through — so a password-protected ClickHouse cannot
-  be authenticated against through this library today, whatever `config` says.
-  Giving the container a password would only produce an authentication failure
-  that has nothing to do with what these tests are checking.
+  That is a choice, not a limitation. Authentication works: `:username` and
+  `:password` are composed into the URL the client sends, so a
+  password-protected ClickHouse authenticates through this library. Giving the
+  container a password would put every test in the suite — the workload tests,
+  the stalled-server tests, the migration tests — behind an authentication the
+  tests are not about, so that a failure in any of them could be a credential
+  problem rather than the thing under test. The composition itself is covered
+  without a server at all, in `ClickhouseExLogger.RepoConfigTest`.
   """
 
   @image "clickhouse/clickhouse-server:26.9"

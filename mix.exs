@@ -9,7 +9,7 @@ defmodule ClickhouseExLogger.MixProject do
   # `ClickhouseExLogger.Repo` itself now collides with this library starting the
   # same connection, and must set `auto_start: false`. See the README's upgrade
   # section.
-  @version "0.3.0"
+  @version "0.3.1"
 
   # The project's one canonical URL. It is the only host this project verifiably
   # has, being the configured `origin`, so `homepage_url` is the repository rather

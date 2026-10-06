@@ -108,4 +108,165 @@ defmodule ClickhouseExLogger.RepoConfigTest do
       assert_raise AshClickhouse.Error.ConfigurationError, fn -> Repo.config() end
     end
   end
+
+  describe "credentials" do
+    # The URL is where the credentials have to go, and that is not a choice this
+    # library made: `AshClickhouse.Repo.config_to_conn_opts/1` forwards `:url` and
+    # drops `:username`/`:password`, and `ClickHouse.Interface.HTTP.Client`'s
+    # `@opts_schema` has no credential key — it would reject one rather than
+    # honour it. hackney turns a URL's userinfo into `basic_auth` and nothing else
+    # supplies one, so a configured password that never reached the URL was
+    # silently discarded and every request arrived as `default`.
+    test "a username and password are composed into the URL" do
+      configure(url: "http://clickhouse.internal:8123", username: "writer", password: "s3cret")
+
+      assert %URI{userinfo: "writer:s3cret"} = composed_url()
+    end
+
+    test "a password with no username authenticates as the server's default user" do
+      configure(url: "http://clickhouse.internal:8123", password: "s3cret")
+
+      assert %URI{userinfo: "default:s3cret"} = composed_url()
+    end
+
+    # A server can protect `default` and leave an application account
+    # password-less. Sending no credentials there authenticates as `default` and
+    # is rejected, so the username alone has to be enough.
+    test "a non-default username with an empty password still authenticates" do
+      configure(url: "http://clickhouse.internal:8123", username: "writer", password: "")
+
+      assert %URI{userinfo: "writer:"} = composed_url()
+    end
+
+    test "the documented default configuration composes to no credentials at all" do
+      # What every existing host has configured. Composing here would start
+      # authenticating all of them against a password-less local server, which
+      # they never asked for.
+      configure(url: "http://clickhouse.internal:8123", username: "default", password: "")
+
+      assert %URI{userinfo: nil} = composed_url()
+    end
+
+    test "a URL with no credentials configured sends no credentials" do
+      configure(url: "http://clickhouse.internal:8123")
+
+      assert %URI{userinfo: nil} = composed_url()
+    end
+
+    test "a URL that already carries userinfo is used verbatim" do
+      url = "http://embedded:secret@clickhouse.internal:8123"
+
+      configure(url: url, username: "writer", password: "s3cret")
+
+      # Verbatim, not re-derived: the host wrote those credentials into the one
+      # string they control, and overriding them would break the host that
+      # already built its URL this way to work around the gap.
+      assert Repo.config()[:url] == url
+    end
+
+    test "credentials are percent-encoded so they cannot move the host or port" do
+      configure(
+        url: "http://clickhouse.internal:8123",
+        username: "user name",
+        password: "p@ss:w/rd #1"
+      )
+
+      uri = composed_url()
+
+      assert uri.host == "clickhouse.internal"
+      assert uri.port == 8123
+      # `nil` rather than `""` for a URL with no path: what matters is that the
+      # password's `/` did not become one.
+      assert uri.path in [nil, ""]
+      assert URI.decode(uri.userinfo) == "user name:p@ss:w/rd #1"
+    end
+
+    test "a non-ASCII credential survives as itself" do
+      configure(url: "http://clickhouse.internal:8123", username: "café", password: "naïve")
+
+      uri = composed_url()
+
+      assert URI.decode(uri.userinfo) == "café:naïve"
+      assert uri.host == "clickhouse.internal"
+    end
+
+    test "the composed URL is what the connection layer receives" do
+      configure(url: "http://clickhouse.internal:8123", username: "writer", password: "s3cret")
+
+      # The seam the whole design rests on. `config_to_conn_opts/1` is what
+      # `child_spec/1`, the supervised connection, and both of the migration's
+      # connections read their `:url` from, so this is what hackney is handed.
+      conn_opts = AshClickhouse.Repo.config_to_conn_opts(Repo)
+
+      assert %URI{userinfo: "writer:s3cret"} = URI.parse(conn_opts[:url])
+    end
+
+    test "a username that is not a string is rejected rather than dropped" do
+      configure(url: "http://clickhouse.internal:8123", username: :writer, password: "s3cret")
+
+      error = assert_raise AshClickhouse.Error.ConfigurationError, fn -> Repo.config() end
+
+      assert Exception.message(error) =~ ":username"
+    end
+
+    test "a password that is not a string is rejected rather than dropped" do
+      configure(url: "http://clickhouse.internal:8123", username: "writer", password: 12_345)
+
+      error = assert_raise AshClickhouse.Error.ConfigurationError, fn -> Repo.config() end
+
+      assert Exception.message(error) =~ ":password"
+    end
+
+    test "a URL with no host is rejected, though it parses" do
+      # `URI.parse("localhost:8123")` succeeds and reads the port as a scheme.
+      # Accepting it would produce a request that fails later as an unreachable
+      # server, which is the diagnosis the other checks here exist to prevent.
+      configure(url: "localhost:8123", username: "writer", password: "s3cret")
+
+      error = assert_raise AshClickhouse.Error.ConfigurationError, fn -> Repo.config() end
+
+      assert Exception.message(error) =~ ":url"
+    end
+
+    test "a URL that is not a string is rejected" do
+      configure(url: :localhost, username: "writer", password: "s3cret")
+
+      error = assert_raise AshClickhouse.Error.ConfigurationError, fn -> Repo.config() end
+
+      assert Exception.message(error) =~ ":url"
+    end
+
+    test "a config that names no URL is left without one" do
+      # `config/0` reports what the host wrote. The default belongs to
+      # `config_to_conn_opts/1`, which is where a host that omitted `:url` has
+      # always got it, and giving this function the same fallback would make the
+      # two disagree about a config the host never wrote.
+      configure(username: "default", password: "")
+
+      refute Keyword.has_key?(Repo.config(), :url)
+    end
+
+    test "the composed URL is not reported through the configuration error" do
+      # The error names the option; it must not echo the value, because the value
+      # carries the password and this library reports its failures through the
+      # logger it is logging to.
+      configure(url: "http://clickhouse.internal:8123", password: 12_345)
+
+      error = assert_raise AshClickhouse.Error.ConfigurationError, fn -> Repo.config() end
+
+      refute Exception.message(error) =~ "12_345"
+    end
+  end
+
+  defp configure(config) do
+    Application.put_env(:clickhouse_ex_logger, Repo, config)
+  end
+
+  defp composed_url do
+    config = Repo.config()
+
+    # `:url` is what the data layer reads, so that is what is parsed here rather
+    # than the host's `:url`, which may legitimately have been replaced.
+    config |> Keyword.fetch!(:url) |> URI.parse()
+  end
 end

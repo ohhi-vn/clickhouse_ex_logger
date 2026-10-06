@@ -5,10 +5,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this proje
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 major version is `0`, a breaking change increments the minor version.
 
-## Unreleased
+## 0.3.1
 
 ### Added
 
+- **Credentials are honoured.** `:username` and `:password` in
+  `config :clickhouse_ex_logger, ClickhouseExLogger.Repo` now authenticate the
+  connection, percent-encoded into the URL the client sends — the only place the
+  stack beneath accepts them. A host authenticating against a
+  password-protected ClickHouse previously had to compose that URL itself in
+  `config/runtime.exs`; that code can be deleted. Every connection is
+  authenticated this way, including the ones both migration entry points open.
 - **The pipeline starts itself.** `ClickhouseExLogger.Application` is the OTP
   application callback: it supervises `ClickhouseExLogger.Repo` and the buffer, and
   `ClickhouseExLogger.HandlerInstaller` attaches the handler. A host that has

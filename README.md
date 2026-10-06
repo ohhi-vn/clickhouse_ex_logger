@@ -44,6 +44,38 @@ Without the check it would fall back to `http://localhost:8123` and quietly
 write your logs somewhere you did not choose — or report every flush as failed,
 which looks like a ClickHouse outage rather than a configuration mistake.
 
+`username:` and `password:` authenticate the connection, as written — no URL
+surgery in your `runtime.exs`. Against a password-protected server that is the
+only change you need:
+
+```sh
+export CLICKHOUSE_URL=http://clickhouse.internal:8123
+export CLICKHOUSE_USER=writer
+export CLICKHOUSE_PASSWORD=...   # the password is percent-encoded for you
+```
+
+<details>
+<summary>Upgrading from a version that ignored these keys</summary>
+
+Before this, `:username` and `:password` were accepted and then discarded: the
+data layer forwards only `:url`, and the client beneath it has no credential
+option. A password-protected server answered every request with
+`Code: 194 ... Authentication failed`, reported and counted as lost — the same
+as an outage. If you worked around it by building the credentialed URL yourself
+in `config/runtime.exs`, delete that: the library does it now.
+
+If you would rather keep the old behaviour — a server that ignores
+authentication, say — put the credentials in the URL instead. A URL that already
+carries them is used verbatim, and `:username`/`:password` are then ignored:
+
+```elixir
+config :clickhouse_ex_logger, ClickhouseExLogger.Repo,
+  url: "http://writer:s3cret@clickhouse.internal:8123",
+  database: "my_app"
+```
+
+</details>
+
 **2. Create the schema.** Run this from your application *before* you start it, so
 the first flush has somewhere to go.
 
@@ -143,6 +175,18 @@ All keys are optional except the connection block above.
 Set once, under `config :clickhouse_ex_logger, ClickhouseExLogger.Repo`. The
 supported keys are those of `AshClickhouse.Repo`: `:url`, `:username`,
 `:password`, `:database`, `:pool_size`, and `:ipv4_only`.
+
+| Key | Meaning |
+| --- | --- |
+| `:url` | ClickHouse HTTP endpoint, e.g. `"http://localhost:8123"`. |
+| `:username` | Authenticates as this user. A value other than `"default"` is sent even with no password. |
+| `:password` | Sent as the password. Percent-encoded into the URL, so `@` and `:` need no escaping. |
+| `:database` | Database holding the `logs` table. |
+
+A URL that already carries credentials — `http://user:pass@host:8123` — is used
+as-is and the two keys above are ignored. Omitting `:username` alongside a
+`:password` authenticates as `default`. Leaving both at their defaults sends no
+credentials at all, which is what a password-less local ClickHouse wants.
 
 ### `:auto_start`
 
