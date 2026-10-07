@@ -5,6 +5,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this proje
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 major version is `0`, a breaking change increments the minor version.
 
+## 0.3.2
+
+### Changed
+
+- **Rows are written through `Ash.bulk_create/4`.** `ClickhouseExLogger.Insert`
+  now calls the data layer's batched insert once per 1000-row chunk instead of
+  hand-building the `INSERT` from the data layer's building blocks. The resource
+  stays the single source of truth for the table, its columns, and their
+  encoding, and a flush is still chunked and stops at the first failing chunk, so
+  the committed-row count the buffer reconciles against is unchanged.
+- **Requires the `ash_clickhouse` release that fixes the `DateTime64` JSON
+  encoding** (0.7.5). Encoding a timestamp as an integer count of microseconds
+  made ClickHouse's JSON reader overflow (`DECIMAL_OVERFLOW`); the fix sends a
+  fractional-second number. The timestamp is no longer pre-encoded as an ISO-8601
+  string to work around the old behaviour.
+- **The data layer's own failure log is at `:debug`.** It previously logged an
+  unmarked `warning`/`error` on every failed insert, which made a failed flush
+  report twice and let a handler writing to the same ClickHouse feed a row
+  describing each failure back into the failing pipeline.
+
+### Fixed
+
+- **A row the resource cannot accept is now reported instead of half-written.**
+  Because the write goes through the resource's `:create` action, a row malformed
+  for the resource — a non-UUID `id`, a missing `timestamp`, an input the table
+  does not define — is rejected for the whole chunk and reported, rather than
+  being sent to ClickHouse. The reported reason names the field and the problem.
+
 ## 0.3.1
 
 ### Added

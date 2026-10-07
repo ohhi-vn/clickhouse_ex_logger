@@ -1,0 +1,11 @@
+schema: spec-driven
+created: 2026-10-07
+
+# No spec delta: this replaces the write-path implementation only. Row contents,
+# delivery order, row-level committed/lost accounting, and the bounded
+# non-blocking logging contract are all preserved, so no requirement text
+# changes. The one observable nuance (a row malformed for the resource is now
+# rejected by the resource's client-side validation instead of the ClickHouse
+# server) still satisfies "the reason names the problem the server or the client
+# reported"; it is recorded in proposal.md and design.md, not the spec.
+skip_specs: true

@@ -9,7 +9,7 @@ defmodule ClickhouseExLogger.MixProject do
   # `ClickhouseExLogger.Repo` itself now collides with this library starting the
   # same connection, and must set `auto_start: false`. See the README's upgrade
   # section.
-  @version "0.3.1"
+  @version "0.3.2"
 
   # The project's one canonical URL. It is the only host this project verifiably
   # has, being the configured `origin`, so `homepage_url` is the repository rather
@@ -190,12 +190,12 @@ defmodule ClickhouseExLogger.MixProject do
   defp deps do
     [
       {:ash, "~> 3.34"},
-      {:ash_clickhouse, "~> 0.7"},
+      {:ash_clickhouse, "~> 0.7.6"},
       {:clickhouse, "~> 0.32"},
       # Provisions the ClickHouse the suite runs against, so a developer needs a
       # container engine and nothing else. `only: :test` keeps it out of every
       # host's dependency tree.
-      {:testcontainer_ex, "~> 0.9.1", only: :test},
+      {:testcontainer_ex, "~> 0.9", only: :test},
       # Hex publishes documentation by running `mix docs`, so without this there is
       # no `docs` task and nothing is published to hexdocs.pm.
       #

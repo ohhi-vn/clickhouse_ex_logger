@@ -343,10 +343,25 @@ defmodule ClickhouseExLogger.BufferTest do
     # struct for `DB::NetException` bodies — neither of which is in
     # `AshClickhouse.Connection`'s rescue list, so both escape the insert.
     #
-    # A row the writer cannot encode is the same shape of failure reachable from
-    # outside the library, and deterministic: `Insert.normalize/1` raises before
-    # any connection is touched, so the spawned process dies having sent nothing.
-    defp dying_row, do: %{id: Ash.UUID.generate(), level: :info, message: "never written"}
+    # A row carrying a value the data layer cannot encode is the same shape of
+    # failure reachable from outside the library, and deterministic: encoding the
+    # metadata raises before a connection is used, so the spawned process dies
+    # having sent nothing. (A missing `timestamp` used to serve this purpose, but
+    # `Ash.bulk_create/4` now rejects it as a validation failure rather than
+    # raising.)
+    defp dying_row do
+      %{
+        id: Ash.UUID.generate(),
+        timestamp: DateTime.utc_now(),
+        level: :info,
+        message: "never written",
+        module: nil,
+        file: nil,
+        line: nil,
+        function: nil,
+        metadata: %{"unencodable" => self()}
+      }
+    end
 
     test "counts the abandoned batch as lost so the counters still reconcile" do
       server = start_buffer(batch_size: 1, flush_interval_ms: 60_000)
@@ -382,9 +397,9 @@ defmodule ClickhouseExLogger.BufferTest do
       assert text =~ "ClickhouseExLogger: dropped 1 buffered log row"
 
       # The reason an operator reads names the failure without the frames that
-      # produced it. A `KeyError` from the writer arrives as an Erlang
-      # `{:badkey, key, map}` reason, which is not an exception struct.
-      assert text =~ ~s(key "timestamp" not found)
+      # produced it. A raise from the metadata encoder arrives as the exception's
+      # own message, not as an inspected internal structure.
+      assert text =~ "String.Chars not implemented for PID"
       refute text =~ "stacktrace"
     end
 

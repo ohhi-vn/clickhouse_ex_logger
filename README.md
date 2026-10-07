@@ -137,6 +137,10 @@ Read the check itself: it is one `SELECT count()` against `system.tables`. Nothi
 is created or altered at boot, ever — see
 [`ClickhouseExLogger.Migration`](https://hexdocs.pm/clickhouse_ex_logger/ClickhouseExLogger.Migration.html).
 
+## Dashboard
+
+Dashboard with basic search/filter & analysis in this [repo](https://github.com/ohhi-vn/logger_dashboard).
+
 ### Upgrading from 0.2.x
 
 0.3.0 starts the pipeline itself. **If your application supervises
@@ -462,17 +466,21 @@ publication with `mix hex.publish --revert VERSION`.
 
 ## A note on `ash_clickhouse`
 
-This library pins `ash_clickhouse ~> 0.7`. In 0.7.3 the data layer's
-`Ash.bulk_create/4` cannot write to ClickHouse — it leaks Ash's internal bulk
-options into the client option list, which the client rejects, and its
-`DateTime64` encoding overflows. `ClickhouseExLogger.Insert` works around both
-using the data layer's own public building blocks, so the resource stays the
-single source of truth for the table and its encoding.
+The library writes through the data layer's batched insert,
+`Ash.bulk_create/4`. Doing that needs two upstream fixes: the data layer must not
+leak Ash's internal bulk options into the client option list, and it must encode
+`DateTime64` in the form ClickHouse's JSON insert accepts (a fractional-second
+number, not an integer tick count, which the JSON reader treats as seconds and
+overflows). Both are present in `ash_clickhouse` 0.7.5. The data layer's own
+failure logging is also at `:debug` there, so the library — not the dependency —
+is what reports a failed flush.
 
-The workaround lives in one module and its docs name both defects. When
-upstream fixes them, `ClickhouseExLogger.Insert` collapses to
-`Ash.bulk_create/4` with no behavioural change. See
-`ClickhouseExLogger.Insert`.
+`ClickhouseExLogger.Insert` still chunks a flush and calls `Ash.bulk_create/4`
+once per 1000-row chunk, rather than once for the whole flush. That is an
+accounting requirement, not a workaround: the data layer does not advertise
+`:bulk_create_with_partial_success`, so a single call cannot report how many rows
+an earlier chunk committed, and `ClickhouseExLogger.Buffer` credits `delivered`
+from exactly that count. See `ClickhouseExLogger.Insert`.
 
 ## License
 

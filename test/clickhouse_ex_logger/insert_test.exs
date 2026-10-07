@@ -39,21 +39,12 @@ defmodule ClickhouseExLogger.InsertTest do
   end
 
   describe "insert/1 timestamp handling" do
-    test "passes an already-encoded timestamp through untouched" do
-      # `normalize/1` re-encodes a `DateTime` because the data layer's encoder
-      # overflows `DateTime64(6)`; anything else is handed on as written.
-      at = ~U[2026-01-02 03:04:05.000006Z]
-
+    test "writes a raw DateTime at full microsecond precision" do
+      # The data layer now encodes `DateTime64(6)` itself, so `insert/1` no longer
+      # pre-encodes the timestamp as an ISO-8601 string to work around the old
+      # overflow.
       assert {:ok, 1} =
-               Insert.insert([row("encoded", %{timestamp: DateTime.to_iso8601(at)})])
-
-      assert TestServer.query!("SELECT toString(timestamp) FROM logs") |> String.trim() ==
-               "2026-01-02 03:04:05.000006"
-    end
-
-    test "encodes a DateTime at full microsecond precision" do
-      assert {:ok, 1} =
-               Insert.insert([row("naive", %{timestamp: ~U[2026-01-02 03:04:05.000006Z]})])
+               Insert.insert([row("usec", %{timestamp: ~U[2026-01-02 03:04:05.000006Z]})])
 
       assert TestServer.query!("SELECT toString(timestamp) FROM logs") |> String.trim() ==
                "2026-01-02 03:04:05.000006"
@@ -69,7 +60,7 @@ defmodule ClickhouseExLogger.InsertTest do
     end
 
     test "reports the rows an earlier chunk committed when a later one is refused" do
-      # 1000 good rows, then one the server rejects. Chunk one commits; chunk
+      # 1000 good rows, then one the resource rejects. Chunk one commits; chunk
       # two is refused and is not retried, so exactly 1000 rows are committed.
       rows =
         Enum.map(1..1_000, &row("committed-#{&1}")) ++
@@ -78,19 +69,34 @@ defmodule ClickhouseExLogger.InsertTest do
       assert {:error, message, 1_000} = Insert.insert(rows)
 
       assert is_binary(message)
-      assert message =~ "Cannot parse UUID"
+      assert message =~ "is invalid"
 
       # The committed chunk is really in ClickHouse, not merely accounted for.
       assert stored_count() == "1000"
     end
   end
 
+  describe "insert/1 is all-or-nothing per chunk" do
+    test "a chunk holding a rejected row commits none of it" do
+      # The valid row shares the chunk with the rejected one, and the chunk
+      # aborts before the data layer is reached, so nothing is written.
+      rows = [row("good"), Map.put(row("bad"), :id, "not-a-uuid")]
+
+      assert {:error, message, 0} = Insert.insert(rows)
+      assert message =~ "is invalid"
+
+      assert stored_count() == "0"
+    end
+  end
+
   describe "insert/1 error reporting" do
-    test "reports the server's complaint rather than swallowing it" do
+    test "reports the resource's rejection rather than swallowing it" do
+      # A row the resource will not accept is rejected before ClickHouse sees it,
+      # and the reported reason names the field and the problem.
       assert {:error, message, 0} = Insert.insert([Map.put(row("bad"), :id, "nope")])
 
-      assert message =~ "Cannot parse UUID"
-      assert message =~ "CANNOT_PARSE_UUID"
+      assert message =~ "id"
+      assert message =~ "is invalid"
     end
 
     test "reports the reason when the database does not exist" do
@@ -213,9 +219,12 @@ defmodule ClickhouseExLogger.InsertTest do
     end
 
     test "a field the resource does not define does not become a column" do
-      # If the column list were restated in `ClickhouseExLogger.Insert`, this key
-      # would either raise or grow a column. Driven by the resource, it is ignored.
-      assert {:ok, 1} = Insert.insert([Map.put(row("extra"), :not_a_column, "ignored")])
+      # The write goes through the resource's `:create` action, so an input the
+      # resource does not define is rejected rather than growing a column.
+      assert {:error, message, 0} =
+               Insert.insert([Map.put(row("extra"), :not_a_column, "ignored")])
+
+      assert message =~ "not_a_column"
 
       assert table_columns() == resource_columns()
       refute "not_a_column" in table_columns()

@@ -1,79 +1,39 @@
 defmodule ClickhouseExLogger.Insert do
   @moduledoc """
-  Writes a batch of rows to ClickHouse.
+  Writes a batch of rows to ClickHouse through `Ash.bulk_create/4`.
 
-  ## Why this exists instead of `Ash.bulk_create/4`
+  ## Why this is a module and not a single `Ash.bulk_create/4` call
 
-  The design calls for the data layer's batched insert, and this module uses the
-  data layer's own building blocks for it — but it cannot use
-  `Ash.bulk_create/4`, because in `ash_clickhouse` 0.7.3 that path does not work.
-  Two separate defects stand in the way, both verified against the installed
-  versions (`ash_clickhouse` 0.7.3, `clickhouse` 0.32.0, ClickHouse 26.9):
+  It uses the data layer's bulk create — the resource remains the single source of
+  truth for the table, its columns, their order, and the value encoding. What it
+  adds is a chunk loop, and the loop is an accounting requirement, not a
+  workaround: `AshClickhouse.DataLayer.can?(:bulk_create_with_partial_success)` is
+  `false`, and the data layer's own chunked `bulk_create/3` returns only an error
+  when a later chunk fails. One `Ash.bulk_create/4` over a whole flush would
+  therefore lose the count of rows an earlier chunk already committed, and
+  `ClickhouseExLogger.Buffer` credits `delivered` from exactly that count. Calling
+  `Ash.bulk_create/4` once per 1000-row chunk keeps the count in this module's
+  hands.
 
-  1. **`Insert.insert_opts/2` leaks Ash's internal options into the client.**
-     `DataLayer.bulk_create/4` computes its client options with
-     `Insert.insert_opts(resource, opts)`, which `Keyword.merge`s Ash's bulk
-     options (`select:`, `upsert?:`, `return_records?:`, `tenant:`, …) into the
-     keyword list handed to `ClickHouse.query/4`. That function validates the
-     list and rejects anything it does not know, so every `Ash.bulk_create/4`
-     fails with `Invalid keyword given ... upsert?: ["is not a valid key"]`.
-     This is client-side and independent of the ClickHouse server version.
+  A flush is chunked at 1000 rows and stops at the first chunk that fails.
+  Chunks before it are already in ClickHouse and cannot be taken back, so
+  `insert/1` returns how many rows were committed alongside any error. `Buffer`
+  uses it to keep `delivered` and `lost` honest.
 
-  2. **`encode_datetime/2` overflows `DateTime64(6)`.** It converts a `DateTime`
-     to an integer count of *microseconds*; the JSON input path reads that as
-     *seconds*, so `Numeric value is out of range for DateTime64`.
+  Each chunk is all-or-nothing: `Ash.bulk_create/4` is called with
+  `stop_on_error?: true`, which aborts on the first row the resource rejects
+  before the data layer is called, and a data layer error fails the whole
+  `INSERT`. So a chunk either commits every row in it or none, and `committed` is
+  the sum of the fully-successful chunks before the failure.
 
-  This module therefore keeps the data layer responsible for everything
-  structural — the qualified table name, the column list and its order, and the
-  value encoding — and works around exactly the two points above. The second is
-  worked around in `normalize/1`, below.
-
-  ## What that gives up, and what it does not
-
-  Lost: Ash's changeset machinery. That is inert for these rows —
-  `ClickhouseExLogger.Event` produces every column from a `:logger` event, the row
-  shape is fixed, and there is nothing to coerce, validate, or merge.
-
-  Kept: the resource is still the single source of truth. Column names, column
-  order, table qualification, UUID encoding and map encoding all come from
-  `ClickhouseExLogger.LogEntry` via the data layer, so the wire format cannot
-  drift from the resource definition.
-
-  ## Field names are converted once per flush, not once per row
-
-  `build_insert_rows/2` reads each row's values by *string* key, so rows reach it
-  with their field names already in wire form. Converting them is not free, and
-  every row in a flush has the same field names — so converting them per row
-  repeated, per row, work whose answer is identical for all of them. `insert/1`
-  reads them once per flush from the resource and reuses them.
-
-  Read from the resource rather than restated here: renaming or reordering an
-  attribute changes the wire form along with the table, which is the property that
-  keeps this module from drifting into a second, hand-maintained copy of the
-  schema.
-
-  ## Partial success is reported, not hidden
-
-  A flush is chunked at 1000 rows. When a chunk fails the ones before it are
-  already in ClickHouse and cannot be taken back, so `insert/1` returns how many
-  rows were committed alongside any error. `ClickhouseExLogger.Buffer` uses it to
-  keep `delivered` and `lost` honest.
-
-  ## When to delete this
-
-  If `Insert.insert_opts/2` stops leaking Ash's internal options, and datetime
-  encoding matches the server, this module collapses to `Ash.bulk_create/4`.
-  Isolating the call here is what makes that a one-place change.
+  Every batch this module writes goes through the resource's `:create` action, so
+  a row malformed for the resource — a non-UUID `id`, a missing `timestamp` — is
+  rejected by the resource's own validation and reported here as a failed chunk,
+  rather than being sent to ClickHouse.
   """
 
-  alias Ash.Resource.Info
-  alias AshClickhouse.DataLayer
-  alias AshClickhouse.DataLayer.Dsl
-  alias AshClickhouse.DataLayer.Insert, as: DataLayerInsert
   alias ClickhouseExLogger.LogEntry
 
-  # `AshClickhouse.DataLayer` chunks its own inserts at 1000 rows; match it so
-  # one buffer flush does not turn into an unexpectedly large single statement.
   @chunk_size 1_000
 
   @doc """
@@ -101,33 +61,15 @@ defmodule ClickhouseExLogger.Insert do
   def insert([]), do: {:ok, 0}
 
   def insert(rows) when is_list(rows) do
-    resource = LogEntry
-
-    # `build_insert_rows/2` looks values up by *string* key
-    # (`Map.fetch(row, to_string(name))`), so hand it string keys or every column
-    # encodes as nil. It then does the encoding itself, with one exception:
-    # timestamps, below.
-    {fields, encoded} =
-      rows
-      |> Enum.map(&normalize(&1, row_field_names(resource)))
-      |> DataLayerInsert.build_insert_rows(resource)
-
-    statement =
-      resource
-      |> DataLayer.qualified_table()
-      |> DataLayerInsert.insert_statement(fields)
-
-    opts = Dsl.insert_opts(resource)
-
-    encoded
+    rows
     |> Enum.chunk_every(@chunk_size)
     |> Enum.reduce_while({:ok, 0}, fn chunk, {:ok, committed} ->
-      case ClickhouseExLogger.Repo.insert_rows(statement, chunk, opts) do
-        {:ok, _result} ->
+      case Ash.bulk_create(chunk, LogEntry, :create, bulk_opts()) do
+        %Ash.BulkResult{status: :success} ->
           {:cont, {:ok, committed + length(chunk)}}
 
-        {:error, reason} ->
-          {:halt, {{:error, describe(reason)}, committed}}
+        %Ash.BulkResult{errors: errors} ->
+          {:halt, {{:error, describe(errors)}, committed}}
       end
     end)
     |> case do
@@ -136,69 +78,57 @@ defmodule ClickhouseExLogger.Insert do
     end
   end
 
-  # The table's field names as the row keys the encoder wants, keyed by the atom the
-  # row carries them under.
-  #
-  # Read from the resource rather than restated, so renaming or reordering an
-  # attribute changes the wire form with the table and cannot drift from it. Built
-  # once per flush rather than per row, because every row in a flush has the same
-  # field names — converting them per row repeated, per row, work whose answer is
-  # identical for all of them.
-  defp row_field_names(resource) do
-    for %{name: name} <- Info.attributes(resource), into: %{}, do: {name, to_string(name)}
+  # `return_records?: false` skips building records nobody reads, and
+  # `return_errors?: true` is what makes a reason available for the report.
+  # `stop_on_error?: true` is what makes a chunk all-or-nothing: without it Ash
+  # writes the rows it can and reports the rest as errors, which would leave
+  # committed rows uncounted. `batch_size` matches this module's chunk size so
+  # one call here is one data layer batch.
+  defp bulk_opts do
+    [
+      batch_size: @chunk_size,
+      return_records?: false,
+      return_errors?: true,
+      stop_on_error?: true
+    ]
   end
 
-  # Workaround 1 is the option-list leak; this covers it plus workaround 2 —
-  # string keys, and the timestamp as an ISO-8601 UTC string, which ClickHouse
-  # parses at full microsecond precision. Pre-encoding it here means
-  # `build_insert_rows/2` sees a binary and passes it through untouched.
-  #
-  # `Map.update!("timestamp", ...)` still raises on a row with no timestamp, as it
-  # always has. The buffer treats a write that dies without reporting as a lost
-  # batch, so a row that could not be encoded is accounted rather than silently
-  # written as an empty column.
-  defp normalize(row, field_names) do
-    row
-    |> string_keys(field_names)
-    |> Map.update!("timestamp", fn
-      %DateTime{} = datetime -> DateTime.to_iso8601(datetime)
-      other -> other
-    end)
-  end
-
-  # The row's own entries, keyed by wire name. Iterating the row rather than the
-  # resource's fields is deliberate: a key the row does not carry must stay absent
-  # rather than become an explicit `nil`, which the encoder would handle differently
-  # from a missing lookup.
-  defp string_keys(row, field_names) do
-    for {key, value} <- row, into: %{} do
-      {wire_name(field_names, key), value}
+  # The reason an operator reads. `Ash.bulk_create/4` reports failures as Ash
+  # error classes, which wrap the server's or the client's own sentence one or
+  # more levels down, so the useful text is the leaf `:message`, not the
+  # container's. Walking `:errors` before `:message` is what keeps a ClickHouse
+  # outage from being reported as an opaque inspection of an internal struct —
+  # and a connection failure is the failure a host most needs to read.
+  defp describe(errors) do
+    errors
+    |> List.wrap()
+    |> Enum.flat_map(&messages/1)
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.uniq()
+    |> case do
+      [] -> "ClickHouse rejected the insert"
+      messages -> Enum.join(messages, "; ")
     end
   end
 
-  # A row key the table does not define cannot be precomputed, and falls back to
-  # converting it. `Map.fetch/2` rather than `Map.get/3`, whose default argument is
-  # evaluated eagerly and would convert every key on every row — the cost this
-  # change exists to remove.
-  defp wire_name(field_names, key) do
-    case Map.fetch(field_names, key) do
-      {:ok, name} -> name
-      :error -> to_string(key)
+  defp messages(%{errors: errors} = error) when is_list(errors) and errors != [] do
+    case Enum.flat_map(errors, &messages/1) do
+      [] -> leaf_message(error)
+      messages -> messages
     end
   end
 
-  # `AshClickhouse.Connection.insert_rows/4` wraps only an exception it rescued. When
-  # the client *returns* an error — the ordinary path for an unreachable server or a
-  # rejected statement — the raw `ClickHouse` error struct comes through
-  # unnormalised, so these are the shapes that actually reach here. Every one of them
-  # carries the server's or the client's own sentence in `:message`.
-  #
-  # Extracting that field is what turns
-  # `%ClickHouse.DatabaseError{code: "81", message: "…", meta: %{summary: "…"}}` into
-  # a line an operator can act on. The whole struct also *contains* the server's text,
-  # so anything that only matches on that text cannot tell the two apart — and a
-  # connection failure is the failure a host most needs to read.
-  defp describe(%{message: message}) when is_binary(message), do: String.trim(message)
-  defp describe(reason) when is_binary(reason), do: reason
-  defp describe(reason), do: inspect(reason)
+  defp messages(error), do: leaf_message(error)
+
+  defp leaf_message(%{message: message} = error) when is_binary(message) do
+    case Map.get(error, :field) do
+      field when is_atom(field) and not is_nil(field) -> ["#{field} #{message}"]
+      field when is_binary(field) -> ["#{field} #{message}"]
+      _missing -> [message]
+    end
+  end
+
+  defp leaf_message(message) when is_binary(message), do: [message]
+  defp leaf_message(error) when is_exception(error), do: [Exception.message(error)]
+  defp leaf_message(other), do: [inspect(other)]
 end
